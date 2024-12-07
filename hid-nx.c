@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * HID driver for Nintendo Switch Controllers
+ * HID driver for Nintendo Switch Joy-Cons and Pro Controllers
  *
  * Copyright (c) 2019-2021 Daniel J. Ogorchock <djogorchock@gmail.com>
  * Portions Copyright (c) 2020 Nadia Holmquist Pedersen <nadia@nhp.sh>
  * Copyright (c) 2022 Emily Strickland <linux@emily.st>
+ * Copyright (c) 2023 Ryan McClelland <rymcclel@gmail.com>
  *
  * The following resources/projects were referenced for this driver:
  *   https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering
@@ -20,7 +21,7 @@
  * Pro Controllers can either be used over USB or Bluetooth.
  *
  * This driver also incorporates support for Nintendo Switch Online controllers
- * for the NES, SNES, and Sega Genesis.
+ * for the NES, SNES, Sega Genesis, and N64.
  *
  * The driver will retrieve the factory calibration info from the controllers,
  * so little to no user calibration should be required.
@@ -33,6 +34,7 @@
 #include <linux/device.h>
 #include <linux/kernel.h>
 #include <linux/hid.h>
+#include <linux/idr.h>
 #include <linux/input.h>
 #include <linux/jiffies.h>
 #include <linux/leds.h>
@@ -46,107 +48,106 @@
  */
 
 /* Output Reports */
-#define NX_CON_OUTPUT_RUMBLE_AND_SUBCMD		0x01
-#define NX_CON_OUTPUT_FW_UPDATE_PKT		0x03
-#define NX_CON_OUTPUT_RUMBLE_ONLY		0x10
-#define NX_CON_OUTPUT_MCU_DATA			0x11
-#define NX_CON_OUTPUT_USB_CMD			0x80
+#define JC_OUTPUT_RUMBLE_AND_SUBCMD	 0x01
+#define JC_OUTPUT_FW_UPDATE_PKT		 0x03
+#define JC_OUTPUT_RUMBLE_ONLY		 0x10
+#define JC_OUTPUT_MCU_DATA		 0x11
+#define JC_OUTPUT_USB_CMD		 0x80
 
 /* Subcommand IDs */
-#define NX_CON_SUBCMD_STATE			0x00
-#define NX_CON_SUBCMD_MANUAL_BT_PAIRING		0x01
-#define NX_CON_SUBCMD_REQ_DEV_INFO		0x02
-#define NX_CON_SUBCMD_SET_REPORT_MODE		0x03
-#define NX_CON_SUBCMD_TRIGGERS_ELAPSED		0x04
-#define NX_CON_SUBCMD_GET_PAGE_LIST_STATE	0x05
-#define NX_CON_SUBCMD_SET_HCI_STATE		0x06
-#define NX_CON_SUBCMD_RESET_PAIRING_INFO	0x07
-#define NX_CON_SUBCMD_LOW_POWER_MODE		0x08
-#define NX_CON_SUBCMD_SPI_FLASH_READ		0x10
-#define NX_CON_SUBCMD_SPI_FLASH_WRITE		0x11
-#define NX_CON_SUBCMD_RESET_MCU			0x20
-#define NX_CON_SUBCMD_SET_MCU_CONFIG		0x21
-#define NX_CON_SUBCMD_SET_MCU_STATE		0x22
-#define NX_CON_SUBCMD_SET_PLAYER_LIGHTS		0x30
-#define NX_CON_SUBCMD_GET_PLAYER_LIGHTS		0x31
-#define NX_CON_SUBCMD_SET_HOME_LIGHT		0x38
-#define NX_CON_SUBCMD_ENABLE_IMU		0x40
-#define NX_CON_SUBCMD_SET_IMU_SENSITIVITY	0x41
-#define NX_CON_SUBCMD_WRITE_IMU_REG		0x42
-#define NX_CON_SUBCMD_READ_IMU_REG		0x43
-#define NX_CON_SUBCMD_ENABLE_VIBRATION		0x48
-#define NX_CON_SUBCMD_GET_REGULATED_VOLTAGE	0x50
+#define JC_SUBCMD_STATE			 0x00
+#define JC_SUBCMD_MANUAL_BT_PAIRING	 0x01
+#define JC_SUBCMD_REQ_DEV_INFO		 0x02
+#define JC_SUBCMD_SET_REPORT_MODE	 0x03
+#define JC_SUBCMD_TRIGGERS_ELAPSED	 0x04
+#define JC_SUBCMD_GET_PAGE_LIST_STATE	 0x05
+#define JC_SUBCMD_SET_HCI_STATE		 0x06
+#define JC_SUBCMD_RESET_PAIRING_INFO	 0x07
+#define JC_SUBCMD_LOW_POWER_MODE	 0x08
+#define JC_SUBCMD_SPI_FLASH_READ	 0x10
+#define JC_SUBCMD_SPI_FLASH_WRITE	 0x11
+#define JC_SUBCMD_RESET_MCU		 0x20
+#define JC_SUBCMD_SET_MCU_CONFIG	 0x21
+#define JC_SUBCMD_SET_MCU_STATE		 0x22
+#define JC_SUBCMD_SET_PLAYER_LIGHTS	 0x30
+#define JC_SUBCMD_GET_PLAYER_LIGHTS	 0x31
+#define JC_SUBCMD_SET_HOME_LIGHT	 0x38
+#define JC_SUBCMD_ENABLE_IMU		 0x40
+#define JC_SUBCMD_SET_IMU_SENSITIVITY	 0x41
+#define JC_SUBCMD_WRITE_IMU_REG		 0x42
+#define JC_SUBCMD_READ_IMU_REG		 0x43
+#define JC_SUBCMD_ENABLE_VIBRATION	 0x48
+#define JC_SUBCMD_GET_REGULATED_VOLTAGE	 0x50
 
 /* Input Reports */
-#define NX_CON_INPUT_BUTTON_EVENT		0x3F
-#define NX_CON_INPUT_SUBCMD_REPLY		0x21
-#define NX_CON_INPUT_IMU_DATA			0x30
-#define NX_CON_INPUT_MCU_DATA			0x31
-#define NX_CON_INPUT_USB_RESPONSE		0x81
+#define JC_INPUT_BUTTON_EVENT		 0x3F
+#define JC_INPUT_SUBCMD_REPLY		 0x21
+#define JC_INPUT_IMU_DATA		 0x30
+#define JC_INPUT_MCU_DATA		 0x31
+#define JC_INPUT_USB_RESPONSE		 0x81
 
 /* Feature Reports */
-#define NX_CON_FEATURE_LAST_SUBCMD		0x02
-#define NX_CON_FEATURE_OTA_FW_UPGRADE		0x70
-#define NX_CON_FEATURE_SETUP_MEM_READ		0x71
-#define NX_CON_FEATURE_MEM_READ			0x72
-#define NX_CON_FEATURE_ERASE_MEM_SECTOR		0x73
-#define NX_CON_FEATURE_MEM_WRITE		0x74
-#define NX_CON_FEATURE_LAUNCH			0x75
+#define JC_FEATURE_LAST_SUBCMD		 0x02
+#define JC_FEATURE_OTA_FW_UPGRADE	 0x70
+#define JC_FEATURE_SETUP_MEM_READ	 0x71
+#define JC_FEATURE_MEM_READ		 0x72
+#define JC_FEATURE_ERASE_MEM_SECTOR	 0x73
+#define JC_FEATURE_MEM_WRITE		 0x74
+#define JC_FEATURE_LAUNCH		 0x75
 
 /* USB Commands */
-#define NX_CON_USB_CMD_CONN_STATUS		0x01
-#define NX_CON_USB_CMD_HANDSHAKE		0x02
-#define NX_CON_USB_CMD_BAUDRATE_3M		0x03
-#define NX_CON_USB_CMD_NO_TIMEOUT		0x04
-#define NX_CON_USB_CMD_EN_TIMEOUT		0x05
-#define NX_CON_USB_RESET			0x06
-#define NX_CON_USB_PRE_HANDSHAKE		0x91
-#define NX_CON_USB_SEND_UART			0x92
+#define JC_USB_CMD_CONN_STATUS		 0x01
+#define JC_USB_CMD_HANDSHAKE		 0x02
+#define JC_USB_CMD_BAUDRATE_3M		 0x03
+#define JC_USB_CMD_NO_TIMEOUT		 0x04
+#define JC_USB_CMD_EN_TIMEOUT		 0x05
+#define JC_USB_RESET			 0x06
+#define JC_USB_PRE_HANDSHAKE		 0x91
+#define JC_USB_SEND_UART		 0x92
 
 /* Magic value denoting presence of user calibration */
-#define NX_CON_CAL_USR_MAGIC_0			0xB2
-#define NX_CON_CAL_USR_MAGIC_1			0xA1
-#define NX_CON_CAL_USR_MAGIC_SIZE		2
+#define JC_CAL_USR_MAGIC_0		 0xB2
+#define JC_CAL_USR_MAGIC_1		 0xA1
+#define JC_CAL_USR_MAGIC_SIZE		 2
 
 /* SPI storage addresses of user calibration data */
-#define NX_CON_CAL_USR_LEFT_MAGIC_ADDR		0x8010
-#define NX_CON_CAL_USR_LEFT_DATA_ADDR		0x8012
-#define NX_CON_CAL_USR_LEFT_DATA_END		0x801A
-#define NX_CON_CAL_USR_RIGHT_MAGIC_ADDR		0x801B
-#define NX_CON_CAL_USR_RIGHT_DATA_ADDR		0x801D
-#define NX_CON_CAL_STICK_DATA_SIZE \
-	(NX_CON_CAL_USR_LEFT_DATA_END - NX_CON_CAL_USR_LEFT_DATA_ADDR + 1)
+#define JC_CAL_USR_LEFT_MAGIC_ADDR	 0x8010
+#define JC_CAL_USR_LEFT_DATA_ADDR	 0x8012
+#define JC_CAL_USR_LEFT_DATA_END	 0x801A
+#define JC_CAL_USR_RIGHT_MAGIC_ADDR	 0x801B
+#define JC_CAL_USR_RIGHT_DATA_ADDR	 0x801D
+#define JC_CAL_STICK_DATA_SIZE \
+	(JC_CAL_USR_LEFT_DATA_END - JC_CAL_USR_LEFT_DATA_ADDR + 1)
 
 /* SPI storage addresses of factory calibration data */
-#define NX_CON_CAL_FCT_DATA_LEFT_ADDR		0x603d
-#define NX_CON_CAL_FCT_DATA_RIGHT_ADDR		0x6046
+#define JC_CAL_FCT_DATA_LEFT_ADDR	 0x603d
+#define JC_CAL_FCT_DATA_RIGHT_ADDR	 0x6046
 
 /* SPI storage addresses of IMU factory calibration data */
-#define NX_CON_IMU_CAL_FCT_DATA_ADDR		0x6020
-#define NX_CON_IMU_CAL_FCT_DATA_END		0x6037
-#define NX_CON_IMU_CAL_DATA_SIZE \
-	(NX_CON_IMU_CAL_FCT_DATA_END - NX_CON_IMU_CAL_FCT_DATA_ADDR + 1)
-
+#define JC_IMU_CAL_FCT_DATA_ADDR	 0x6020
+#define JC_IMU_CAL_FCT_DATA_END	 0x6037
+#define JC_IMU_CAL_DATA_SIZE \
+	(JC_IMU_CAL_FCT_DATA_END - JC_IMU_CAL_FCT_DATA_ADDR + 1)
 /* SPI storage addresses of IMU user calibration data */
-#define NX_CON_IMU_CAL_USR_MAGIC_ADDR		0x8026
-#define NX_CON_IMU_CAL_USR_DATA_ADDR		0x8028
+#define JC_IMU_CAL_USR_MAGIC_ADDR	 0x8026
+#define JC_IMU_CAL_USR_DATA_ADDR	 0x8028
 
 /* The raw analog joystick values will be mapped in terms of this magnitude */
-#define NX_CON_MAX_STICK_MAG			32767
-#define NX_CON_STICK_FUZZ			250
-#define NX_CON_STICK_FLAT			500
+#define JC_MAX_STICK_MAG		 32767
+#define JC_STICK_FUZZ			 250
+#define JC_STICK_FLAT			 500
 
 /* Hat values for pro controller's d-pad */
-#define NX_CON_MAX_DPAD_MAG			1
-#define NX_CON_DPAD_FUZZ			0
-#define NX_CON_DPAD_FLAT			0
+#define JC_MAX_DPAD_MAG		1
+#define JC_DPAD_FUZZ		0
+#define JC_DPAD_FLAT		0
 
 /* Under most circumstances IMU reports are pushed every 15ms; use as default */
-#define NX_CON_IMU_DFLT_AVG_DELTA_MS		15
+#define JC_IMU_DFLT_AVG_DELTA_MS	15
 /* How many samples to sum before calculating average IMU report delta */
-#define NX_CON_IMU_SAMPLES_PER_DELTA_AVG	300
+#define JC_IMU_SAMPLES_PER_DELTA_AVG	300
 /* Controls how many dropped IMU packets at once trigger a warning message */
-#define NX_CON_IMU_DROPPED_PKT_WARNING		3
+#define JC_IMU_DROPPED_PKT_WARNING	3
 
 /*
  * The controller's accelerometer has a sensor resolution of 16bits and is
@@ -155,10 +156,10 @@
  * Resolution per G (rather than per millliG): 4.096 * 1000 = 4096 digits per G
  * Alternatively: 1/4096 = .0002441 Gs per digit
  */
-#define NX_CON_IMU_MAX_ACCEL_MAG		32767
-#define NX_CON_IMU_ACCEL_RES_PER_G		4096
-#define NX_CON_IMU_ACCEL_FUZZ			10
-#define NX_CON_IMU_ACCEL_FLAT			0
+#define JC_IMU_MAX_ACCEL_MAG		32767
+#define JC_IMU_ACCEL_RES_PER_G		4096
+#define JC_IMU_ACCEL_FUZZ		10
+#define JC_IMU_ACCEL_FLAT		0
 
 /*
  * The controller's gyroscope has a sensor resolution of 16bits and is
@@ -175,21 +176,21 @@
  * Now, 14.247 truncating to 14 loses a lot of precision, so we rescale the
  * min/max range by 1000.
  */
-#define NX_CON_IMU_PREC_RANGE_SCALE		1000
+#define JC_IMU_PREC_RANGE_SCALE	1000
 /* Note: change mag and res_per_dps if prec_range_scale is ever altered */
-#define NX_CON_IMU_MAX_GYRO_MAG			32767000 /* (2^16-1)*1000 */
-#define NX_CON_IMU_GYRO_RES_PER_DPS		14247 /* (14.247*1000) */
-#define NX_CON_IMU_GYRO_FUZZ			10
-#define NX_CON_IMU_GYRO_FLAT			0
+#define JC_IMU_MAX_GYRO_MAG		32767000 /* (2^16-1)*1000 */
+#define JC_IMU_GYRO_RES_PER_DPS		14247 /* (14.247*1000) */
+#define JC_IMU_GYRO_FUZZ		10
+#define JC_IMU_GYRO_FLAT		0
 
 /* frequency/amplitude tables for rumble */
-struct nx_con_rumble_freq_data {
+struct joycon_rumble_freq_data {
 	u16 high;
 	u8 low;
 	u16 freq; /* Hz*/
 };
 
-struct nx_con_rumble_amp_data {
+struct joycon_rumble_amp_data {
 	u8 high;
 	u16 low;
 	u16 amp;
@@ -200,7 +201,7 @@ struct nx_con_rumble_amp_data {
  * These tables are from
  * https://github.com/dekuNukem/Nintendo_Switch_Reverse_Engineering/blob/master/rumble_data_table.md
  */
-static const struct nx_con_rumble_freq_data nx_con_rumble_frequencies[] = {
+static const struct joycon_rumble_freq_data joycon_rumble_frequencies[] = {
 	/* high, low, freq */
 	{ 0x0000, 0x01,   41 }, { 0x0000, 0x02,   42 }, { 0x0000, 0x03,   43 },
 	{ 0x0000, 0x04,   44 }, { 0x0000, 0x05,   45 }, { 0x0000, 0x06,   46 },
@@ -257,8 +258,8 @@ static const struct nx_con_rumble_freq_data nx_con_rumble_frequencies[] = {
 	{ 0xf401, 0x00, 1199 }, { 0xf801, 0x00, 1226 }, { 0xfc01, 0x00, 1253 }
 };
 
-#define nx_con_max_rumble_amp	(1003)
-static const struct nx_con_rumble_amp_data nx_con_rumble_amplitudes[] = {
+#define joycon_max_rumble_amp	(1003)
+static const struct joycon_rumble_amp_data joycon_rumble_amplitudes[] = {
 	/* high, low, amp */
 	{ 0x00, 0x0040,    0 },
 	{ 0x02, 0x8040,   10 }, { 0x04, 0x0041,   12 }, { 0x06, 0x8041,   14 },
@@ -294,67 +295,72 @@ static const struct nx_con_rumble_amp_data nx_con_rumble_amplitudes[] = {
 	{ 0xb6, 0x806d,  825 }, { 0xb8, 0x006e,  843 }, { 0xba, 0x806e,  862 },
 	{ 0xbc, 0x006f,  881 }, { 0xbe, 0x806f,  900 }, { 0xc0, 0x0070,  920 },
 	{ 0xc2, 0x8070,  940 }, { 0xc4, 0x0071,  960 }, { 0xc6, 0x8071,  981 },
-	{ 0xc8, 0x0072, nx_con_max_rumble_amp }
+	{ 0xc8, 0x0072, joycon_max_rumble_amp }
 };
-static const u16 NX_CON_RUMBLE_DFLT_LOW_FREQ 	= 160;
-static const u16 NX_CON_RUMBLE_DFLT_HIGH_FREQ	= 320;
+static const u16 JC_RUMBLE_DFLT_LOW_FREQ = 160;
+static const u16 JC_RUMBLE_DFLT_HIGH_FREQ = 320;
+static const unsigned short JC_RUMBLE_ZERO_AMP_PKT_CNT = 5;
 #endif /* IS_ENABLED(CONFIG_NINTENDO_FF) */
-static const u16 NX_CON_RUMBLE_PERIOD_MS	= 50;
+static const u16 JC_RUMBLE_PERIOD_MS = 50;
 
 /* States for controller state machine */
-enum nx_con_state {
-	NX_CON_STATE_INIT,
-	NX_CON_STATE_READ,
-	NX_CON_STATE_REMOVED,
+enum joycon_ctlr_state {
+	JOYCON_CTLR_STATE_INIT,
+	JOYCON_CTLR_STATE_READ,
+	JOYCON_CTLR_STATE_REMOVED,
 };
 
 /* Controller type received as part of device info */
-enum nx_con_type {
-	NX_CON_TYPE_JCL		= 0x01,
-	NX_CON_TYPE_JCR		= 0x02,
-	NX_CON_TYPE_PRO		= 0x03,
-	NX_CON_TYPE_NESL	= 0x09,
-	NX_CON_TYPE_NESR	= 0x0A,
-	NX_CON_TYPE_SNES	= 0x0B,
-	NX_CON_TYPE_GEN		= 0x0D,
-	NX_CON_TYPE_N64		= 0x0C,
+enum joycon_ctlr_type {
+	JOYCON_CTLR_TYPE_JCL  = 0x01,
+	JOYCON_CTLR_TYPE_JCR  = 0x02,
+	JOYCON_CTLR_TYPE_PRO  = 0x03,
+	JOYCON_CTLR_TYPE_NESL = 0x09,
+	JOYCON_CTLR_TYPE_NESR = 0x0A,
+	JOYCON_CTLR_TYPE_SNES = 0x0B,
+	JOYCON_CTLR_TYPE_GEN  = 0x0D,
+	JOYCON_CTLR_TYPE_N64  = 0x0C,
 };
 
-struct nx_con_stick_cal {
+struct joycon_stick_cal {
 	s32 max;
 	s32 min;
 	s32 center;
 };
 
-struct nx_con_imu_cal {
+struct joycon_imu_cal {
 	s16 offset[3];
 	s16 scale[3];
 };
 
-static const u32 NX_CON_BTN_Y		= BIT(0);
-static const u32 NX_CON_BTN_X		= BIT(1);
-static const u32 NX_CON_BTN_B		= BIT(2);
-static const u32 NX_CON_BTN_A		= BIT(3);
-static const u32 NX_CON_BTN_SR_R	= BIT(4);
-static const u32 NX_CON_BTN_SL_R	= BIT(5);
-static const u32 NX_CON_BTN_R		= BIT(6);
-static const u32 NX_CON_BTN_ZR		= BIT(7);
-static const u32 NX_CON_BTN_MINUS	= BIT(8);
-static const u32 NX_CON_BTN_PLUS	= BIT(9);
-static const u32 NX_CON_BTN_RSTICK	= BIT(10);
-static const u32 NX_CON_BTN_LSTICK	= BIT(11);
-static const u32 NX_CON_BTN_HOME	= BIT(12);
-static const u32 NX_CON_BTN_CAP		= BIT(13);
-static const u32 NX_CON_BTN_DOWN	= BIT(16);
-static const u32 NX_CON_BTN_UP		= BIT(17);
-static const u32 NX_CON_BTN_RIGHT	= BIT(18);
-static const u32 NX_CON_BTN_LEFT	= BIT(19);
-static const u32 NX_CON_BTN_SR_L	= BIT(20);
-static const u32 NX_CON_BTN_SL_L	= BIT(21);
-static const u32 NX_CON_BTN_L		= BIT(22);
-static const u32 NX_CON_BTN_ZL		= BIT(23);
+/*
+ * All the controller's button values are stored in a u32.
+ * They can be accessed with bitwise ANDs.
+ */
+#define JC_BTN_Y	 BIT(0)
+#define JC_BTN_X	 BIT(1)
+#define JC_BTN_B	 BIT(2)
+#define JC_BTN_A	 BIT(3)
+#define JC_BTN_SR_R	 BIT(4)
+#define JC_BTN_SL_R	 BIT(5)
+#define JC_BTN_R	 BIT(6)
+#define JC_BTN_ZR	 BIT(7)
+#define JC_BTN_MINUS	 BIT(8)
+#define JC_BTN_PLUS	 BIT(9)
+#define JC_BTN_RSTICK	 BIT(10)
+#define JC_BTN_LSTICK	 BIT(11)
+#define JC_BTN_HOME	 BIT(12)
+#define JC_BTN_CAP	 BIT(13) /* capture button */
+#define JC_BTN_DOWN	 BIT(16)
+#define JC_BTN_UP	 BIT(17)
+#define JC_BTN_RIGHT	 BIT(18)
+#define JC_BTN_LEFT	 BIT(19)
+#define JC_BTN_SR_L	 BIT(20)
+#define JC_BTN_SL_L	 BIT(21)
+#define JC_BTN_L	 BIT(22)
+#define JC_BTN_ZL	 BIT(23)
 
-struct nx_con_button_mapping {
+struct joycon_ctlr_button_mapping {
 	u32 code;
 	u32 bit;
 };
@@ -362,16 +368,16 @@ struct nx_con_button_mapping {
 /*
  * D-pad is configured as buttons for the left Joy-Con only!
  */
-static const struct nx_con_button_mapping left_joycon_button_mappings[] = {
-	{ BTN_TL,		NX_CON_BTN_L,		},
-	{ BTN_TL2,		NX_CON_BTN_ZL,		},
-	{ BTN_SELECT,		NX_CON_BTN_MINUS,	},
-	{ BTN_THUMBL,		NX_CON_BTN_LSTICK,	},
-	{ BTN_DPAD_UP,		NX_CON_BTN_UP,		},
-	{ BTN_DPAD_DOWN,	NX_CON_BTN_DOWN,	},
-	{ BTN_DPAD_LEFT,	NX_CON_BTN_LEFT,	},
-	{ BTN_DPAD_RIGHT,	NX_CON_BTN_RIGHT,	},
-	{ BTN_1,		NX_CON_BTN_CAP,		},
+static const struct joycon_ctlr_button_mapping left_joycon_button_mappings[] = {
+	{ BTN_TL,		JC_BTN_L,	},
+	{ BTN_TL2,		JC_BTN_ZL,	},
+	{ BTN_SELECT,		JC_BTN_MINUS,	},
+	{ BTN_THUMBL,		JC_BTN_LSTICK,	},
+	{ BTN_DPAD_UP,		JC_BTN_UP,	},
+	{ BTN_DPAD_DOWN,	JC_BTN_DOWN,	},
+	{ BTN_DPAD_LEFT,	JC_BTN_LEFT,	},
+	{ BTN_DPAD_RIGHT,	JC_BTN_RIGHT,	},
+	{ BTN_Z,		JC_BTN_CAP,	},
 	{ /* sentinel */ },
 };
 
@@ -379,22 +385,22 @@ static const struct nx_con_button_mapping left_joycon_button_mappings[] = {
  * The unused *right*-side triggers become the SL/SR triggers for the *left*
  * Joy-Con, if and only if we're not using a charging grip.
  */
-static const struct nx_con_button_mapping left_joycon_s_button_mappings[] = {
-	{ BTN_TR,	NX_CON_BTN_SL_L,	},
-	{ BTN_TR2,	NX_CON_BTN_SR_L,	},
+static const struct joycon_ctlr_button_mapping left_joycon_s_button_mappings[] = {
+	{ BTN_TR,	JC_BTN_SL_L,	},
+	{ BTN_TR2,	JC_BTN_SR_L,	},
 	{ /* sentinel */ },
 };
 
-static const struct nx_con_button_mapping right_joycon_button_mappings[] = {
-	{ BTN_EAST,	NX_CON_BTN_A,		},
-	{ BTN_SOUTH,	NX_CON_BTN_B,		},
-	{ BTN_NORTH,	NX_CON_BTN_X,		},
-	{ BTN_WEST,	NX_CON_BTN_Y,		},
-	{ BTN_TR,	NX_CON_BTN_R,		},
-	{ BTN_TR2,	NX_CON_BTN_ZR,		},
-	{ BTN_START,	NX_CON_BTN_PLUS,	},
-	{ BTN_THUMBR,	NX_CON_BTN_RSTICK,	},
-	{ BTN_0,	NX_CON_BTN_HOME,	},
+static const struct joycon_ctlr_button_mapping right_joycon_button_mappings[] = {
+	{ BTN_EAST,	JC_BTN_A,	},
+	{ BTN_SOUTH,	JC_BTN_B,	},
+	{ BTN_NORTH,	JC_BTN_X,	},
+	{ BTN_WEST,	JC_BTN_Y,	},
+	{ BTN_TR,	JC_BTN_R,	},
+	{ BTN_TR2,	JC_BTN_ZR,	},
+	{ BTN_START,	JC_BTN_PLUS,	},
+	{ BTN_THUMBR,	JC_BTN_RSTICK,	},
+	{ BTN_MODE,	JC_BTN_HOME,	},
 	{ /* sentinel */ },
 };
 
@@ -402,51 +408,51 @@ static const struct nx_con_button_mapping right_joycon_button_mappings[] = {
  * The unused *left*-side triggers become the SL/SR triggers for the *right*
  * Joy-Con, if and only if we're not using a charging grip.
  */
-static const struct nx_con_button_mapping right_joycon_s_button_mappings[] = {
-	{ BTN_TL,	NX_CON_BTN_SL_R,	},
-	{ BTN_TL2,	NX_CON_BTN_SR_R,	},
+static const struct joycon_ctlr_button_mapping right_joycon_s_button_mappings[] = {
+	{ BTN_TL,	JC_BTN_SL_R,	},
+	{ BTN_TL2,	JC_BTN_SR_R,	},
 	{ /* sentinel */ },
 };
 
-static const struct nx_con_button_mapping procon_button_mappings[] = {
-	{ BTN_EAST,	NX_CON_BTN_A,		},
-	{ BTN_SOUTH,	NX_CON_BTN_B,		},
-	{ BTN_NORTH,	NX_CON_BTN_X,		},
-	{ BTN_WEST,	NX_CON_BTN_Y,		},
-	{ BTN_TL,	NX_CON_BTN_L,		},
-	{ BTN_TR,	NX_CON_BTN_R,		},
-	{ BTN_TL2,	NX_CON_BTN_ZL,		},
-	{ BTN_TR2,	NX_CON_BTN_ZR,		},
-	{ BTN_SELECT,	NX_CON_BTN_MINUS,	},
-	{ BTN_START,	NX_CON_BTN_PLUS,	},
-	{ BTN_THUMBL,	NX_CON_BTN_LSTICK,	},
-	{ BTN_THUMBR,	NX_CON_BTN_RSTICK,	},
-	{ BTN_0,	NX_CON_BTN_HOME,	},
-	{ BTN_1,	NX_CON_BTN_CAP,		},
+static const struct joycon_ctlr_button_mapping procon_button_mappings[] = {
+	{ BTN_EAST,	JC_BTN_A,	},
+	{ BTN_SOUTH,	JC_BTN_B,	},
+	{ BTN_NORTH,	JC_BTN_X,	},
+	{ BTN_WEST,	JC_BTN_Y,	},
+	{ BTN_TL,	JC_BTN_L,	},
+	{ BTN_TR,	JC_BTN_R,	},
+	{ BTN_TL2,	JC_BTN_ZL,	},
+	{ BTN_TR2,	JC_BTN_ZR,	},
+	{ BTN_SELECT,	JC_BTN_MINUS,	},
+	{ BTN_START,	JC_BTN_PLUS,	},
+	{ BTN_THUMBL,	JC_BTN_LSTICK,	},
+	{ BTN_THUMBR,	JC_BTN_RSTICK,	},
+	{ BTN_MODE,	JC_BTN_HOME,	},
+	{ BTN_Z,	JC_BTN_CAP,	},
 	{ /* sentinel */ },
 };
 
-static const struct nx_con_button_mapping nescon_button_mappings[] = {
-	{ BTN_SOUTH,	NX_CON_BTN_A,		},
-	{ BTN_EAST,	NX_CON_BTN_B,		},
-	{ BTN_TL,	NX_CON_BTN_L,		},
-	{ BTN_TR,	NX_CON_BTN_R,		},
-	{ BTN_SELECT,	NX_CON_BTN_MINUS,	},
-	{ BTN_START,	NX_CON_BTN_PLUS,	},
+static const struct joycon_ctlr_button_mapping nescon_button_mappings[] = {
+	{ BTN_SOUTH,	JC_BTN_A,	},
+	{ BTN_EAST,	JC_BTN_B,	},
+	{ BTN_TL,	JC_BTN_L,	},
+	{ BTN_TR,	JC_BTN_R,	},
+	{ BTN_SELECT,	JC_BTN_MINUS,	},
+	{ BTN_START,	JC_BTN_PLUS,	},
 	{ /* sentinel */ },
 };
 
-static const struct nx_con_button_mapping snescon_button_mappings[] = {
-	{ BTN_SOUTH,	NX_CON_BTN_A,		},
-	{ BTN_EAST,	NX_CON_BTN_B,		},
-	{ BTN_NORTH,	NX_CON_BTN_X,		},
-	{ BTN_WEST,	NX_CON_BTN_Y,		},
-	{ BTN_TL,	NX_CON_BTN_L,		},
-	{ BTN_TR,	NX_CON_BTN_R,		},
-	{ BTN_TL2,	NX_CON_BTN_ZL,		},
-	{ BTN_TR2,	NX_CON_BTN_ZR,		},
-	{ BTN_SELECT,	NX_CON_BTN_MINUS,	},
-	{ BTN_START,	NX_CON_BTN_PLUS,	},
+static const struct joycon_ctlr_button_mapping snescon_button_mappings[] = {
+	{ BTN_EAST,	JC_BTN_A,	},
+	{ BTN_SOUTH,	JC_BTN_B,	},
+	{ BTN_NORTH,	JC_BTN_X,	},
+	{ BTN_WEST,	JC_BTN_Y,	},
+	{ BTN_TL,	JC_BTN_L,	},
+	{ BTN_TR,	JC_BTN_R,	},
+	{ BTN_TL2,	JC_BTN_ZL,	},
+	{ BTN_TR2,	JC_BTN_ZR,	},
+	{ BTN_SELECT,	JC_BTN_MINUS,	},
+	{ BTN_START,	JC_BTN_PLUS,	},
 	{ /* sentinel */ },
 };
 
@@ -454,50 +460,50 @@ static const struct nx_con_button_mapping snescon_button_mappings[] = {
  * "A", "B", and "C" are mapped positionally, rather than by label (e.g., "A"
  * gets assigned to BTN_EAST instead of BTN_A).
  */
-static const struct nx_con_button_mapping gencon_button_mappings[] = {
-	{ BTN_SOUTH,	NX_CON_BTN_A,		},
-	{ BTN_EAST,	NX_CON_BTN_B,		},
-	{ BTN_WEST,	NX_CON_BTN_R,		},
-	{ BTN_SELECT,	NX_CON_BTN_ZR,		},
-	{ BTN_START,	NX_CON_BTN_PLUS,	},
-	{ BTN_0,	NX_CON_BTN_HOME,	},
-	{ BTN_1,	NX_CON_BTN_CAP,		},
+static const struct joycon_ctlr_button_mapping gencon_button_mappings[] = {
+	{ BTN_SOUTH,	JC_BTN_A,	},
+	{ BTN_EAST,	JC_BTN_B,	},
+	{ BTN_WEST,	JC_BTN_R,	},
+	{ BTN_SELECT,	JC_BTN_ZR,	},
+	{ BTN_START,	JC_BTN_PLUS,	},
+	{ BTN_MODE,	JC_BTN_HOME,	},
+	{ BTN_Z,	JC_BTN_CAP,	},
 	{ /* sentinel */ },
 };
 
 /*
  * N64's C buttons get assigned to d-pad directions and registered as buttons.
  */
-static const struct nx_con_button_mapping n64con_button_mappings[] = {
-	{ BTN_A,		NX_CON_BTN_A,		},
-	{ BTN_B,		NX_CON_BTN_B,		},
-	{ BTN_Z,		NX_CON_BTN_ZL,		},
-	{ BTN_TL,		NX_CON_BTN_L,		},
-	{ BTN_TR,		NX_CON_BTN_R,		},
-	{ BTN_TR2,		NX_CON_BTN_LSTICK,	},
-	{ BTN_START,		NX_CON_BTN_PLUS,	},
-	{ BTN_DPAD_UP,		NX_CON_BTN_Y,		},
-	{ BTN_DPAD_DOWN,	NX_CON_BTN_ZR,		},
-	{ BTN_DPAD_LEFT,	NX_CON_BTN_X,		},
-	{ BTN_DPAD_RIGHT,	NX_CON_BTN_MINUS,	},
-	{ BTN_0,		NX_CON_BTN_HOME,	},
-	{ BTN_1,		NX_CON_BTN_CAP,		},
+static const struct joycon_ctlr_button_mapping n64con_button_mappings[] = {
+	{ BTN_A,		JC_BTN_A,	},
+	{ BTN_B,		JC_BTN_B,	},
+	{ BTN_TL2,		JC_BTN_ZL,	}, /* Z */
+	{ BTN_TL,		JC_BTN_L,	},
+	{ BTN_TR,		JC_BTN_R,	},
+	{ BTN_TR2,		JC_BTN_LSTICK,	}, /* ZR */
+	{ BTN_START,		JC_BTN_PLUS,	},
+	{ BTN_FORWARD,		JC_BTN_Y,	}, /* C UP */
+	{ BTN_BACK,		JC_BTN_ZR,	}, /* C DOWN */
+	{ BTN_LEFT,		JC_BTN_X,	}, /* C LEFT */
+	{ BTN_RIGHT,		JC_BTN_MINUS,	}, /* C RIGHT */
+	{ BTN_MODE,		JC_BTN_HOME,	},
+	{ BTN_Z,		JC_BTN_CAP,	},
 	{ /* sentinel */ },
 };
 
-enum nx_con_msg_type {
-	NX_CON_MSG_TYPE_NONE,
-	NX_CON_MSG_TYPE_USB,
-	NX_CON_MSG_TYPE_SUBCMD,
+enum joycon_msg_type {
+	JOYCON_MSG_TYPE_NONE,
+	JOYCON_MSG_TYPE_USB,
+	JOYCON_MSG_TYPE_SUBCMD,
 };
 
-struct nx_con_rumble_output {
+struct joycon_rumble_output {
 	u8 output_id;
 	u8 packet_num;
 	u8 rumble_data[8];
 } __packed;
 
-struct nx_con_subcmd_request {
+struct joycon_subcmd_request {
 	u8 output_id; /* must be 0x01 for subcommand, 0x10 for rumble only */
 	u8 packet_num; /* incremented every send */
 	u8 rumble_data[8];
@@ -505,13 +511,13 @@ struct nx_con_subcmd_request {
 	u8 data[]; /* length depends on the subcommand */
 } __packed;
 
-struct nx_con_subcmd_reply {
+struct joycon_subcmd_reply {
 	u8 ack; /* MSB 1 for ACK, 0 for NACK */
 	u8 id; /* id of requested subcmd */
 	u8 data[]; /* will be at most 35 bytes */
 } __packed;
 
-struct nx_con_imu_data {
+struct joycon_imu_data {
 	s16 accel_x;
 	s16 accel_y;
 	s16 accel_z;
@@ -520,7 +526,7 @@ struct nx_con_imu_data {
 	s16 gyro_z;
 } __packed;
 
-struct nx_con_input_report {
+struct joycon_input_report {
 	u8 id;
 	u8 timer;
 	u8 bat_con; /* battery and connection info */
@@ -530,68 +536,71 @@ struct nx_con_input_report {
 	u8 vibrator_report;
 
 	union {
-		struct nx_con_subcmd_reply subcmd_reply;
+		struct joycon_subcmd_reply subcmd_reply;
 		/* IMU input reports contain 3 samples */
-		u8 imu_raw_bytes[sizeof(struct nx_con_imu_data) * 3];
+		u8 imu_raw_bytes[sizeof(struct joycon_imu_data) * 3];
 	};
 } __packed;
 
-#define NX_CON_MAX_RESP_SIZE		(sizeof(struct nx_con_input_report) + 35)
-#define NX_CON_RUMBLE_DATA_SIZE		8
-#define NX_CON_RUMBLE_QUEUE_SIZE	8
+#define JC_MAX_RESP_SIZE	(sizeof(struct joycon_input_report) + 35)
+#define JC_RUMBLE_DATA_SIZE	8
+#define JC_RUMBLE_QUEUE_SIZE	8
 
-static const unsigned short NX_CON_RUMBLE_ZERO_AMP_PKT_CNT = 5;
-
-/* for compat with kernels before 5.16 */
-#ifndef LED_FUNCTION_PLAYER1
-#define LED_FUNCTION_PLAYER1 "player-1"
-#define LED_FUNCTION_PLAYER2 "player-2"
-#define LED_FUNCTION_PLAYER3 "player-3"
-#define LED_FUNCTION_PLAYER4 "player-4"
-#define LED_FUNCTION_PLAYER5 "player-5"
-#endif
-
-static const char * nx_con_player_led_names[] = {
-	LED_FUNCTION_PLAYER1,
-	LED_FUNCTION_PLAYER2,
-	LED_FUNCTION_PLAYER3,
-	LED_FUNCTION_PLAYER4,
+static const char * const joycon_player_led_names[] = {
+	"player-1",
+	"player-2",
+	"player-3",
+	"player-4",
+};
+#define JC_NUM_LEDS		ARRAY_SIZE(joycon_player_led_names)
+#define JC_NUM_LED_PATTERNS 8
+/* Taken from https://www.nintendo.com/my/support/qa/detail/33822 */
+static const enum led_brightness joycon_player_led_patterns[JC_NUM_LED_PATTERNS][JC_NUM_LEDS] = {
+	{ 1, 0, 0, 0 },
+	{ 1, 1, 0, 0 },
+	{ 1, 1, 1, 0 },
+	{ 1, 1, 1, 1 },
+	{ 1, 0, 0, 1 },
+	{ 1, 0, 1, 0 },
+	{ 1, 0, 1, 1 },
+	{ 0, 1, 1, 0 },
 };
 
-#define NX_CON_NUM_LEDS ARRAY_SIZE(nx_con_player_led_names)
-
-/* Each physical controller is associated with a nx_con struct */
-struct nx_con {
+/* Each physical controller is associated with a joycon_ctlr struct */
+struct joycon_ctlr {
 	struct hid_device *hdev;
-	struct input_dev *idev;
-	struct led_classdev leds[NX_CON_NUM_LEDS]; /* player leds */
+	struct input_dev *input;
+	u32 player_id;
+	struct led_classdev leds[JC_NUM_LEDS]; /* player leds */
 	struct led_classdev home_led;
-	enum nx_con_state state;
+	enum joycon_ctlr_state ctlr_state;
 	spinlock_t lock;
 	u8 mac_addr[6];
 	char *mac_addr_str;
-	enum nx_con_type type;
+	enum joycon_ctlr_type ctlr_type;
 
 	/* The following members are used for synchronous sends/receives */
-	enum nx_con_msg_type msg_type;
+	enum joycon_msg_type msg_type;
 	u8 subcmd_num;
 	struct mutex output_mutex;
-	u8 input_buf[NX_CON_MAX_RESP_SIZE];
+	u8 input_buf[JC_MAX_RESP_SIZE];
 	wait_queue_head_t wait;
 	bool received_resp;
 	u8 usb_ack_match;
 	u8 subcmd_ack_match;
 	bool received_input_report;
+	unsigned int last_input_report_msecs;
 	unsigned int last_subcmd_sent_msecs;
+	unsigned int consecutive_valid_report_deltas;
 
 	/* factory calibration data */
-	struct nx_con_stick_cal left_stick_cal_x;
-	struct nx_con_stick_cal left_stick_cal_y;
-	struct nx_con_stick_cal right_stick_cal_x;
-	struct nx_con_stick_cal right_stick_cal_y;
+	struct joycon_stick_cal left_stick_cal_x;
+	struct joycon_stick_cal left_stick_cal_y;
+	struct joycon_stick_cal right_stick_cal_x;
+	struct joycon_stick_cal right_stick_cal_y;
 
-	struct nx_con_imu_cal accel_cal;
-	struct nx_con_imu_cal gyro_cal;
+	struct joycon_imu_cal accel_cal;
+	struct joycon_imu_cal gyro_cal;
 
 	/* prevents needlessly recalculating these divisors every sample */
 	s32 imu_cal_accel_divisor[3];
@@ -605,7 +614,7 @@ struct nx_con {
 	bool host_powered;
 
 	/* rumble */
-	u8 rumble_data[NX_CON_RUMBLE_QUEUE_SIZE][NX_CON_RUMBLE_DATA_SIZE];
+	u8 rumble_data[JC_RUMBLE_QUEUE_SIZE][JC_RUMBLE_DATA_SIZE];
 	int rumble_queue_head;
 	int rumble_queue_tail;
 	struct workqueue_struct *rumble_queue;
@@ -618,7 +627,7 @@ struct nx_con {
 	unsigned short rumble_zero_countdown;
 
 	/* imu */
-	struct input_dev *imu_idev;
+	struct input_dev *imu_input;
 	bool imu_first_packet_received; /* helps in initiating timestamp */
 	unsigned int imu_timestamp_us; /* timestamp we report to userspace */
 	unsigned int imu_last_pkt_ms; /* used to calc imu report delta */
@@ -627,6 +636,28 @@ struct nx_con {
 	unsigned int imu_delta_samples_sum;
 	unsigned int imu_avg_delta_ms;
 };
+
+/* Helper macros for checking controller type */
+#define jc_type_is_joycon(ctlr) \
+	(ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_JOYCONL || \
+	 ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_JOYCONR || \
+	 ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_CHRGGRIP)
+#define jc_type_is_procon(ctlr) \
+	(ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_PROCON)
+#define jc_type_is_chrggrip(ctlr) \
+	(ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_CHRGGRIP)
+
+/* Does this controller have inputs associated with left joycon? */
+#define jc_type_has_left(ctlr) \
+	(ctlr->ctlr_type == JOYCON_CTLR_TYPE_JCL || \
+	 ctlr->ctlr_type == JOYCON_CTLR_TYPE_PRO || \
+	 ctlr->ctlr_type == JOYCON_CTLR_TYPE_N64)
+
+/* Does this controller have inputs associated with right joycon? */
+#define jc_type_has_right(ctlr) \
+	(ctlr->ctlr_type == JOYCON_CTLR_TYPE_JCR || \
+	 ctlr->ctlr_type == JOYCON_CTLR_TYPE_PRO)
+
 
 /*
  * Controller device helpers
@@ -638,48 +669,38 @@ struct nx_con {
  * These helpers are most useful early during the HID probe or in conjunction
  * with the capability helpers below.
  */
-static inline bool nx_con_device_is_left_joycon(struct nx_con *con)
+static inline bool joycon_device_is_procon(struct joycon_ctlr *ctlr)
 {
-	return con->hdev->product == USB_DEVICE_ID_NINTENDO_JOYCONL;
+	return ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_PROCON;
 }
 
-static inline bool nx_con_device_is_right_joycon(struct nx_con *con)
+static inline bool joycon_device_is_chrggrip(struct joycon_ctlr *ctlr)
 {
-	return con->hdev->product == USB_DEVICE_ID_NINTENDO_JOYCONR;
+	return ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_CHRGGRIP;
 }
 
-static inline bool nx_con_device_is_procon(struct nx_con *con)
+static inline bool joycon_device_is_snescon(struct joycon_ctlr *ctlr)
 {
-	return con->hdev->product == USB_DEVICE_ID_NINTENDO_PROCON;
+	return ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_SNESCON;
 }
 
-static inline bool nx_con_device_is_chrggrip(struct nx_con *con)
+static inline bool joycon_device_is_gencon(struct joycon_ctlr *ctlr)
 {
-	return con->hdev->product == USB_DEVICE_ID_NINTENDO_CHRGGRIP;
+	return ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_GENCON;
 }
 
-static inline bool nx_con_device_is_snescon(struct nx_con *con)
+static inline bool joycon_device_is_n64con(struct joycon_ctlr *ctlr)
 {
-	return con->hdev->product == USB_DEVICE_ID_NINTENDO_SNESCON;
+	return ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_N64CON;
 }
 
-static inline bool nx_con_device_is_gencon(struct nx_con *con)
+static inline bool joycon_device_has_usb(struct joycon_ctlr *ctlr)
 {
-	return con->hdev->product == USB_DEVICE_ID_NINTENDO_GENCON;
-}
-
-static inline bool nx_con_device_is_n64con(struct nx_con *con)
-{
-	return con->hdev->product == USB_DEVICE_ID_NINTENDO_N64CON;
-}
-
-static inline bool nx_con_device_has_usb(struct nx_con *con)
-{
-	return nx_con_device_is_procon(con) ||
-	       nx_con_device_is_chrggrip(con) ||
-	       nx_con_device_is_snescon(con) ||
-	       nx_con_device_is_gencon(con) ||
-	       nx_con_device_is_n64con(con);
+	return joycon_device_is_procon(ctlr) ||
+	       joycon_device_is_chrggrip(ctlr) ||
+	       joycon_device_is_snescon(ctlr) ||
+	       joycon_device_is_gencon(ctlr) ||
+	       joycon_device_is_n64con(ctlr);
 }
 
 /*
@@ -695,69 +716,57 @@ static inline bool nx_con_device_has_usb(struct nx_con *con)
  * the reporting method and then request the device info; (2) they can't
  * distinguish all controllers (like the Charging Grip from the Pro controller.)
  */
-static inline bool nx_con_type_is_left_joycon(struct nx_con *con)
+static inline bool joycon_type_is_left_joycon(struct joycon_ctlr *ctlr)
 {
-	return con->type == NX_CON_TYPE_JCL;
+	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_JCL;
 }
 
-static inline bool nx_con_type_is_right_joycon(struct nx_con *con)
+static inline bool joycon_type_is_right_joycon(struct joycon_ctlr *ctlr)
 {
-	return con->type == NX_CON_TYPE_JCR;
+	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_JCR;
 }
 
-static inline bool nx_con_type_is_procon(struct nx_con *con)
+static inline bool joycon_type_is_procon(struct joycon_ctlr *ctlr)
 {
-	return con->type == NX_CON_TYPE_PRO;
+	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_PRO;
 }
 
-static inline bool nx_con_type_is_snescon(struct nx_con *con)
+static inline bool joycon_type_is_snescon(struct joycon_ctlr *ctlr)
 {
-	return con->type == NX_CON_TYPE_SNES;
+	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_SNES;
 }
 
-static inline bool nx_con_type_is_gencon(struct nx_con *con)
+static inline bool joycon_type_is_gencon(struct joycon_ctlr *ctlr)
 {
-	return con->type == NX_CON_TYPE_GEN;
+	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_GEN;
 }
 
-static inline bool nx_con_type_is_n64con(struct nx_con *con)
+static inline bool joycon_type_is_n64con(struct joycon_ctlr *ctlr)
 {
-	return con->type == NX_CON_TYPE_N64;
+	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_N64;
 }
 
-static inline bool nx_con_type_is_left_nescon(struct nx_con *con)
+static inline bool joycon_type_is_left_nescon(struct joycon_ctlr *ctlr)
 {
-	return con->type == NX_CON_TYPE_NESL;
+	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_NESL;
 }
 
-static inline bool nx_con_type_is_right_nescon(struct nx_con *con)
+static inline bool joycon_type_is_right_nescon(struct joycon_ctlr *ctlr)
 {
-	return con->type == NX_CON_TYPE_NESR;
+	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_NESR;
 }
 
-static inline bool nx_con_type_has_left_controls(struct nx_con *con)
+static inline bool joycon_type_is_any_joycon(struct joycon_ctlr *ctlr)
 {
-	return nx_con_type_is_left_joycon(con) ||
-	       nx_con_type_is_procon(con);
+	return joycon_type_is_left_joycon(ctlr) ||
+	       joycon_type_is_right_joycon(ctlr) ||
+	       joycon_device_is_chrggrip(ctlr);
 }
 
-static inline bool nx_con_type_has_right_controls(struct nx_con *con)
+static inline bool joycon_type_is_any_nescon(struct joycon_ctlr *ctlr)
 {
-	return nx_con_type_is_right_joycon(con) ||
-	       nx_con_type_is_procon(con);
-}
-
-static inline bool nx_con_type_is_any_joycon(struct nx_con *con)
-{
-	return nx_con_type_is_left_joycon(con) ||
-	       nx_con_type_is_right_joycon(con) ||
-	       nx_con_device_is_chrggrip(con);
-}
-
-static inline bool nx_con_type_is_any_nescon(struct nx_con *con)
-{
-	return nx_con_type_is_left_nescon(con) ||
-	       nx_con_type_is_right_nescon(con);
+	return joycon_type_is_left_nescon(ctlr) ||
+	       joycon_type_is_right_nescon(ctlr);
 }
 
 /*
@@ -767,61 +776,71 @@ static inline bool nx_con_type_is_any_nescon(struct nx_con *con)
  * capabilities during initialization. They are always accurate but (since they
  * use type helpers) cannot be used early in the HID probe.
  */
-static inline bool nx_con_has_imu(struct nx_con *con)
+static inline bool joycon_has_imu(struct joycon_ctlr *ctlr)
 {
-	return nx_con_device_is_chrggrip(con) ||
-	       nx_con_type_is_any_joycon(con) ||
-	       nx_con_type_is_procon(con);
+	return joycon_device_is_chrggrip(ctlr) ||
+	       joycon_type_is_any_joycon(ctlr) ||
+	       joycon_type_is_procon(ctlr);
 }
 
-static inline bool nx_con_has_joysticks(struct nx_con *con)
+static inline bool joycon_has_joysticks(struct joycon_ctlr *ctlr)
 {
-	return nx_con_device_is_chrggrip(con) ||
-	       nx_con_type_is_any_joycon(con) ||
-	       nx_con_type_is_procon(con) ||
-	       nx_con_type_is_n64con(con);
+	return joycon_device_is_chrggrip(ctlr) ||
+	       joycon_type_is_any_joycon(ctlr) ||
+	       joycon_type_is_procon(ctlr) ||
+	       joycon_type_is_n64con(ctlr);
 }
 
-static inline bool nx_con_has_rumble(struct nx_con *con)
+static inline bool joycon_has_rumble(struct joycon_ctlr *ctlr)
 {
-	return nx_con_device_is_chrggrip(con) ||
-	       nx_con_type_is_any_joycon(con) ||
-	       nx_con_type_is_procon(con) ||
-	       nx_con_type_is_n64con(con);
+	return joycon_device_is_chrggrip(ctlr) ||
+	       joycon_type_is_any_joycon(ctlr) ||
+	       joycon_type_is_procon(ctlr) ||
+	       joycon_type_is_n64con(ctlr);
 }
 
-static int __nx_con_hid_send(struct hid_device *hdev, u8 *data, size_t len)
+static inline bool joycon_using_usb(struct joycon_ctlr *ctlr)
+{
+	return ctlr->hdev->bus == BUS_USB;
+}
+
+static int __joycon_hid_send(struct hid_device *hdev, u8 *data, size_t len)
 {
 	u8 *buf;
 	int ret;
 
-	if (!(buf = kmemdup(data, len, GFP_KERNEL)))
+	buf = kmemdup(data, len, GFP_KERNEL);
+	if (!buf)
 		return -ENOMEM;
-
-	if ((ret = hid_hw_output_report(hdev, buf, len)) < 0)
-		hid_dbg(hdev, "Failed to send output report ret=%d\n", ret);
-
+	ret = hid_hw_output_report(hdev, buf, len);
 	kfree(buf);
+	if (ret < 0)
+		hid_dbg(hdev, "Failed to send output report ret=%d\n", ret);
 	return ret;
 }
 
-static void nx_con_wait_for_input_report(struct nx_con *con)
+static void joycon_wait_for_input_report(struct joycon_ctlr *ctlr)
 {
+	int ret;
+
 	/*
 	 * If we are in the proper reporting mode, wait for an input
 	 * report prior to sending the subcommand. This improves
 	 * reliability considerably.
 	 */
-	if (con->state == NX_CON_STATE_READ) {
+	if (ctlr->ctlr_state == JOYCON_CTLR_STATE_READ) {
 		unsigned long flags;
 
-		spin_lock_irqsave(&con->lock, flags);
-		con->received_input_report = false;
-		spin_unlock_irqrestore(&con->lock, flags);
-
+		spin_lock_irqsave(&ctlr->lock, flags);
+		ctlr->received_input_report = false;
+		spin_unlock_irqrestore(&ctlr->lock, flags);
+		ret = wait_event_timeout(ctlr->wait,
+					 ctlr->received_input_report,
+					 HZ / 4);
 		/* We will still proceed, even with a timeout here */
-		if (!wait_event_timeout(con->wait, con->received_input_report, HZ / 4))
-			hid_warn(con->hdev, "timeout waiting for input report\n");
+		if (!ret)
+			hid_warn(ctlr->hdev,
+				 "timeout waiting for input report\n");
 	}
 }
 
@@ -829,22 +848,58 @@ static void nx_con_wait_for_input_report(struct nx_con *con)
  * Sending subcommands and/or rumble data at too high a rate can cause bluetooth
  * controller disconnections.
  */
-static void nx_con_enforce_subcmd_rate(struct nx_con *con)
+#define JC_INPUT_REPORT_MIN_DELTA	8
+#define JC_INPUT_REPORT_MAX_DELTA	17
+#define JC_SUBCMD_TX_OFFSET_MS		4
+#define JC_SUBCMD_VALID_DELTA_REQ	3
+#define JC_SUBCMD_RATE_MAX_ATTEMPTS	500
+#define JC_SUBCMD_RATE_LIMITER_USB_MS	20
+#define JC_SUBCMD_RATE_LIMITER_BT_MS	60
+#define JC_SUBCMD_RATE_LIMITER_MS(ctlr)	((ctlr)->hdev->bus == BUS_USB ? JC_SUBCMD_RATE_LIMITER_USB_MS : JC_SUBCMD_RATE_LIMITER_BT_MS)
+static void joycon_enforce_subcmd_rate(struct joycon_ctlr *ctlr)
 {
-	static const unsigned int max_subcmd_rate_ms = 25;
-	unsigned int current_ms = jiffies_to_msecs(jiffies);
-	unsigned int delta_ms = current_ms - con->last_subcmd_sent_msecs;
+	unsigned int current_ms;
+	unsigned long subcmd_delta;
+	int consecutive_valid_deltas = 0;
+	int attempts = 0;
+	unsigned long flags;
 
-	while (delta_ms < max_subcmd_rate_ms &&
-	       con->state == NX_CON_STATE_READ) {
-		nx_con_wait_for_input_report(con);
+	if (unlikely(ctlr->ctlr_state != JOYCON_CTLR_STATE_READ))
+		return;
+
+	do {
+		joycon_wait_for_input_report(ctlr);
 		current_ms = jiffies_to_msecs(jiffies);
-		delta_ms = current_ms - con->last_subcmd_sent_msecs;
+		subcmd_delta = current_ms - ctlr->last_subcmd_sent_msecs;
+
+		spin_lock_irqsave(&ctlr->lock, flags);
+		consecutive_valid_deltas = ctlr->consecutive_valid_report_deltas;
+		spin_unlock_irqrestore(&ctlr->lock, flags);
+
+		attempts++;
+	} while ((consecutive_valid_deltas < JC_SUBCMD_VALID_DELTA_REQ ||
+		  subcmd_delta < JC_SUBCMD_RATE_LIMITER_MS(ctlr)) &&
+		 ctlr->ctlr_state == JOYCON_CTLR_STATE_READ &&
+		 attempts < JC_SUBCMD_RATE_MAX_ATTEMPTS);
+
+	if (attempts >= JC_SUBCMD_RATE_MAX_ATTEMPTS) {
+		hid_warn(ctlr->hdev, "%s: exceeded max attempts", __func__);
+		return;
 	}
-	con->last_subcmd_sent_msecs = current_ms;
+
+	ctlr->last_subcmd_sent_msecs = current_ms;
+
+	/*
+	 * Wait a short time after receiving an input report before
+	 * transmitting. This should reduce odds of a TX coinciding with an RX.
+	 * Minimizing concurrent BT traffic with the controller seems to lower
+	 * the rate of disconnections.
+	 */
+	msleep(JC_SUBCMD_TX_OFFSET_MS);
 }
 
-static int nx_con_hid_send_sync(struct nx_con *con, u8 *data, size_t len, u32 timeout)
+static int joycon_hid_send_sync(struct joycon_ctlr *ctlr, u8 *data, size_t len,
+				u32 timeout)
 {
 	int ret;
 	int tries = 2;
@@ -854,19 +909,24 @@ static int nx_con_hid_send_sync(struct nx_con *con, u8 *data, size_t len, u32 ti
 	 * doing one retry after a timeout appears to always work.
 	 */
 	while (tries--) {
-		nx_con_enforce_subcmd_rate(con);
+		joycon_enforce_subcmd_rate(ctlr);
 
-		if ((ret = __nx_con_hid_send(con->hdev, data, len)) < 0) {
-			memset(con->input_buf, 0, NX_CON_MAX_RESP_SIZE);
+		ret = __joycon_hid_send(ctlr->hdev, data, len);
+		if (ret < 0) {
+			memset(ctlr->input_buf, 0, JC_MAX_RESP_SIZE);
 			return ret;
 		}
 
-		if (!wait_event_timeout(con->wait, con->received_resp, timeout)) {
-			hid_dbg(con->hdev, "synchronous send/receive timed out\n");
+		ret = wait_event_timeout(ctlr->wait, ctlr->received_resp,
+					 timeout);
+		if (!ret) {
+			hid_dbg(ctlr->hdev,
+				"synchronous send/receive timed out\n");
 			if (tries) {
-				hid_dbg(con->hdev, "retrying sync send after timeout\n");
+				hid_dbg(ctlr->hdev,
+					"retrying sync send after timeout\n");
 			}
-			memset(con->input_buf, 0, NX_CON_MAX_RESP_SIZE);
+			memset(ctlr->input_buf, 0, JC_MAX_RESP_SIZE);
 			ret = -ETIMEDOUT;
 		} else {
 			ret = 0;
@@ -874,82 +934,98 @@ static int nx_con_hid_send_sync(struct nx_con *con, u8 *data, size_t len, u32 ti
 		}
 	}
 
-	con->received_resp = false;
+	ctlr->received_resp = false;
 	return ret;
 }
 
-static int nx_con_send_usb(struct nx_con *con, u8 cmd, u32 timeout)
+static int joycon_send_usb(struct joycon_ctlr *ctlr, u8 cmd, u32 timeout)
 {
 	int ret;
-	u8 buf[64] = {NX_CON_OUTPUT_USB_CMD};
+	u8 buf[2] = {JC_OUTPUT_USB_CMD};
 
 	buf[1] = cmd;
-	con->usb_ack_match = cmd;
-	con->msg_type = NX_CON_MSG_TYPE_USB;
-	if ((ret = nx_con_hid_send_sync(con, buf, sizeof(buf), timeout)))
-		hid_dbg(con->hdev, "send usb command failed; ret=%d\n", ret);
+	ctlr->usb_ack_match = cmd;
+	ctlr->msg_type = JOYCON_MSG_TYPE_USB;
+	ret = joycon_hid_send_sync(ctlr, buf, sizeof(buf), timeout);
+	if (ret)
+		hid_dbg(ctlr->hdev, "send usb command failed; ret=%d\n", ret);
 	return ret;
 }
 
-static int nx_con_send_subcmd(struct nx_con *con,
-			      struct nx_con_subcmd_request *subcmd,
-			      size_t data_len,
-			      u32 timeout)
+static int joycon_send_subcmd(struct joycon_ctlr *ctlr,
+			      struct joycon_subcmd_request *subcmd,
+			      size_t data_len, u32 timeout)
 {
 	int ret;
 	unsigned long flags;
 
-	spin_lock_irqsave(&con->lock, flags);
+	spin_lock_irqsave(&ctlr->lock, flags);
 	/*
 	 * If the controller has been removed, just return ENODEV so the LED
 	 * subsystem doesn't print invalid errors on removal.
 	 */
-	if (con->state == NX_CON_STATE_REMOVED) {
-		spin_unlock_irqrestore(&con->lock, flags);
+	if (ctlr->ctlr_state == JOYCON_CTLR_STATE_REMOVED) {
+		spin_unlock_irqrestore(&ctlr->lock, flags);
 		return -ENODEV;
 	}
-	memcpy(subcmd->rumble_data, con->rumble_data[con->rumble_queue_tail],
-	       NX_CON_RUMBLE_DATA_SIZE);
-	spin_unlock_irqrestore(&con->lock, flags);
+	memcpy(subcmd->rumble_data, ctlr->rumble_data[ctlr->rumble_queue_tail],
+	       JC_RUMBLE_DATA_SIZE);
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 
-	subcmd->output_id = NX_CON_OUTPUT_RUMBLE_AND_SUBCMD;
-	subcmd->packet_num = con->subcmd_num;
-	if (++con->subcmd_num > 0xF)
-		con->subcmd_num = 0;
-	con->subcmd_ack_match = subcmd->subcmd_id;
-	con->msg_type = NX_CON_MSG_TYPE_SUBCMD;
+	subcmd->output_id = JC_OUTPUT_RUMBLE_AND_SUBCMD;
+	subcmd->packet_num = ctlr->subcmd_num;
+	if (++ctlr->subcmd_num > 0xF)
+		ctlr->subcmd_num = 0;
+	ctlr->subcmd_ack_match = subcmd->subcmd_id;
+	ctlr->msg_type = JOYCON_MSG_TYPE_SUBCMD;
 
-	if ((ret = nx_con_hid_send_sync(con,
-					(u8 *)subcmd,
-					sizeof(*subcmd) + data_len,
-					timeout)) < 0)
-		hid_dbg(con->hdev, "send subcommand failed; ret=%d\n", ret);
+	ret = joycon_hid_send_sync(ctlr, (u8 *)subcmd,
+				   sizeof(*subcmd) + data_len, timeout);
+	if (ret < 0)
+		hid_dbg(ctlr->hdev, "send subcommand failed; ret=%d\n", ret);
 	else
 		ret = 0;
 	return ret;
 }
 
 /* Supply nibbles for flash and on. Ones correspond to active */
-static int nx_con_set_player_leds(struct nx_con *con, u8 flash, u8 on)
+static int joycon_set_player_leds(struct joycon_ctlr *ctlr, u8 flash, u8 on)
 {
-	struct nx_con_subcmd_request *req;
+	struct joycon_subcmd_request *req;
 	u8 buffer[sizeof(*req) + 1] = { 0 };
 
-	req = (struct nx_con_subcmd_request *)buffer;
-	req->subcmd_id = NX_CON_SUBCMD_SET_PLAYER_LIGHTS;
+	req = (struct joycon_subcmd_request *)buffer;
+	req->subcmd_id = JC_SUBCMD_SET_PLAYER_LIGHTS;
 	req->data[0] = (flash << 4) | on;
 
-	hid_dbg(con->hdev, "setting player leds\n");
-	return nx_con_send_subcmd(con, req, 1, HZ/4);
+	hid_dbg(ctlr->hdev, "setting player leds\n");
+	return joycon_send_subcmd(ctlr, req, 1, HZ/4);
 }
 
-static int nx_con_request_spi_flash_read(struct nx_con *con,
-					 u32 start_addr,
-					 u8 size,
-					 u8 **reply)
+static int joycon_set_home_led(struct joycon_ctlr *ctlr, enum led_brightness brightness)
 {
-	struct nx_con_subcmd_request *req;
-	struct nx_con_input_report *report;
+	struct joycon_subcmd_request *req;
+	u8 buffer[sizeof(*req) + 5] = { 0 };
+	u8 *data;
+
+	req = (struct joycon_subcmd_request *)buffer;
+	req->subcmd_id = JC_SUBCMD_SET_HOME_LIGHT;
+	data = req->data;
+	data[0] = 0x01;
+	data[1] = brightness << 4;
+	data[2] = brightness | (brightness << 4);
+	data[3] = 0x11;
+	data[4] = 0x11;
+
+	hid_dbg(ctlr->hdev, "setting home led brightness\n");
+	return joycon_send_subcmd(ctlr, req, 5, HZ/4);
+}
+
+static int joycon_request_spi_flash_read(struct joycon_ctlr *ctlr,
+					 u32 start_addr, u8 size, u8 **reply)
+{
+	struct joycon_subcmd_request *req;
+	struct joycon_input_report *report;
 	u8 buffer[sizeof(*req) + 5] = { 0 };
 	u8 *data;
 	int ret;
@@ -957,17 +1033,18 @@ static int nx_con_request_spi_flash_read(struct nx_con *con,
 	if (!reply)
 		return -EINVAL;
 
-	req = (struct nx_con_subcmd_request *)buffer;
-	req->subcmd_id = NX_CON_SUBCMD_SPI_FLASH_READ;
+	req = (struct joycon_subcmd_request *)buffer;
+	req->subcmd_id = JC_SUBCMD_SPI_FLASH_READ;
 	data = req->data;
 	put_unaligned_le32(start_addr, data);
 	data[4] = size;
 
-	hid_dbg(con->hdev, "requesting SPI flash data\n");
-	if ((ret = nx_con_send_subcmd(con, req, 5, HZ))) {
-		hid_err(con->hdev, "failed reading SPI flash; ret=%d\n", ret);
+	hid_dbg(ctlr->hdev, "requesting SPI flash data\n");
+	ret = joycon_send_subcmd(ctlr, req, 5, HZ);
+	if (ret) {
+		hid_err(ctlr->hdev, "failed reading SPI flash; ret=%d\n", ret);
 	} else {
-		report = (struct nx_con_input_report *)con->input_buf;
+		report = (struct joycon_input_report *)ctlr->input_buf;
 		/* The read data starts at the 6th byte */
 		*reply = &report->subcmd_reply.data[5];
 	}
@@ -978,62 +1055,73 @@ static int nx_con_request_spi_flash_read(struct nx_con *con,
  * User calibration's presence is denoted with a magic byte preceding it.
  * returns 0 if magic val is present, 1 if not present, < 0 on error
  */
-static int nx_con_check_for_cal_magic(struct nx_con *con, u32 flash_addr)
+static int joycon_check_for_cal_magic(struct joycon_ctlr *ctlr, u32 flash_addr)
 {
 	int ret;
 	u8 *reply;
 
-	if ((ret = nx_con_request_spi_flash_read(con,
-						 flash_addr,
-						 NX_CON_CAL_USR_MAGIC_SIZE,
-						 &reply)))
+	ret = joycon_request_spi_flash_read(ctlr, flash_addr,
+					    JC_CAL_USR_MAGIC_SIZE, &reply);
+	if (ret)
 		return ret;
 
-	return reply[0] != NX_CON_CAL_USR_MAGIC_0 ||
-	       reply[1] != NX_CON_CAL_USR_MAGIC_1;
+	return reply[0] != JC_CAL_USR_MAGIC_0 || reply[1] != JC_CAL_USR_MAGIC_1;
 }
 
-static int nx_con_read_stick_calibration(struct nx_con *con,
-					 u16 cal_addr,
-					 struct nx_con_stick_cal *cal_x,
-					 struct nx_con_stick_cal *cal_y,
+static int joycon_read_stick_calibration(struct joycon_ctlr *ctlr, u16 cal_addr,
+					 struct joycon_stick_cal *cal_x,
+					 struct joycon_stick_cal *cal_y,
 					 bool left_stick)
 {
 	s32 x_max_above;
 	s32 x_min_below;
 	s32 y_max_above;
 	s32 y_min_below;
-	u8 *raw;
+	u8 *raw_cal;
 	int ret;
 
-	if ((ret = nx_con_request_spi_flash_read(con,
-						 cal_addr,
-						 NX_CON_CAL_STICK_DATA_SIZE,
-						 &raw)))
+	ret = joycon_request_spi_flash_read(ctlr, cal_addr,
+					    JC_CAL_STICK_DATA_SIZE, &raw_cal);
+	if (ret)
 		return ret;
 
 	/* stick calibration parsing: note the order differs based on stick */
 	if (left_stick) {
-		x_max_above = hid_field_extract(con->hdev, (raw + 0), 0, 12);
-		y_max_above = hid_field_extract(con->hdev, (raw + 1), 4, 12);
-		cal_x->center = hid_field_extract(con->hdev, (raw + 3), 0, 12);
-		cal_y->center = hid_field_extract(con->hdev, (raw + 4), 4, 12);
-		x_min_below = hid_field_extract(con->hdev, (raw + 6), 0, 12);
-		y_min_below = hid_field_extract(con->hdev, (raw + 7), 4, 12);
+		x_max_above = hid_field_extract(ctlr->hdev, (raw_cal + 0), 0,
+						12);
+		y_max_above = hid_field_extract(ctlr->hdev, (raw_cal + 1), 4,
+						12);
+		cal_x->center = hid_field_extract(ctlr->hdev, (raw_cal + 3), 0,
+						  12);
+		cal_y->center = hid_field_extract(ctlr->hdev, (raw_cal + 4), 4,
+						  12);
+		x_min_below = hid_field_extract(ctlr->hdev, (raw_cal + 6), 0,
+						12);
+		y_min_below = hid_field_extract(ctlr->hdev, (raw_cal + 7), 4,
+						12);
 	} else {
-		cal_x->center = hid_field_extract(con->hdev, (raw + 0), 0, 12);
-		cal_y->center = hid_field_extract(con->hdev, (raw + 1), 4, 12);
-		x_min_below = hid_field_extract(con->hdev, (raw + 3), 0, 12);
-		y_min_below = hid_field_extract(con->hdev, (raw + 4), 4, 12);
-		x_max_above = hid_field_extract(con->hdev, (raw + 6), 0, 12);
-		y_max_above = hid_field_extract(con->hdev, (raw + 7), 4, 12);
+		cal_x->center = hid_field_extract(ctlr->hdev, (raw_cal + 0), 0,
+						  12);
+		cal_y->center = hid_field_extract(ctlr->hdev, (raw_cal + 1), 4,
+						  12);
+		x_min_below = hid_field_extract(ctlr->hdev, (raw_cal + 3), 0,
+						12);
+		y_min_below = hid_field_extract(ctlr->hdev, (raw_cal + 4), 4,
+						12);
+		x_max_above = hid_field_extract(ctlr->hdev, (raw_cal + 6), 0,
+						12);
+		y_max_above = hid_field_extract(ctlr->hdev, (raw_cal + 7), 4,
+						12);
 	}
 
+	cal_x->max = cal_x->center + x_max_above;
+	cal_x->min = cal_x->center - x_min_below;
+	cal_y->max = cal_y->center + y_max_above;
+	cal_y->min = cal_y->center - y_min_below;
+
 	/* check if calibration values are plausible */
-	if (cal_x->min >= cal_x->center || 
-	    cal_x->center >= cal_x->max ||
-	    cal_y->min >= cal_y->center ||
-	    cal_y->center >= cal_y->max)
+	if (cal_x->min >= cal_x->center || cal_x->center >= cal_x->max ||
+	    cal_y->min >= cal_y->center || cal_y->center >= cal_y->max)
 		ret = -EINVAL;
 
 	return ret;
@@ -1042,83 +1130,83 @@ static int nx_con_read_stick_calibration(struct nx_con *con,
 static const u16 DFLT_STICK_CAL_CEN = 2000;
 static const u16 DFLT_STICK_CAL_MAX = 3500;
 static const u16 DFLT_STICK_CAL_MIN = 500;
-
-static void nx_con_use_default_calibration(struct hid_device *hdev,
-					   struct nx_con_stick_cal *cal_x,
-					   struct nx_con_stick_cal *cal_y,
-					   const char *stick,
-					   int ret)
+static void joycon_use_default_calibration(struct hid_device *hdev,
+					   struct joycon_stick_cal *cal_x,
+					   struct joycon_stick_cal *cal_y,
+					   const char *stick, int ret)
 {
-	hid_warn(hdev, "Failed to read %s stick cal, using defaults; e=%d\n", stick, ret);
+	hid_warn(hdev,
+		 "Failed to read %s stick cal, using defaults; e=%d\n",
+		 stick, ret);
 
 	cal_x->center = cal_y->center = DFLT_STICK_CAL_CEN;
 	cal_x->max = cal_y->max = DFLT_STICK_CAL_MAX;
 	cal_x->min = cal_y->min = DFLT_STICK_CAL_MIN;
 }
 
-static int nx_con_request_calibration(struct nx_con *con)
+static int joycon_request_calibration(struct joycon_ctlr *ctlr)
 {
-	u16 left_stick_addr = NX_CON_CAL_FCT_DATA_LEFT_ADDR;
-	u16 right_stick_addr = NX_CON_CAL_FCT_DATA_RIGHT_ADDR;
+	u16 left_stick_addr = JC_CAL_FCT_DATA_LEFT_ADDR;
+	u16 right_stick_addr = JC_CAL_FCT_DATA_RIGHT_ADDR;
 	int ret;
 
-	hid_dbg(con->hdev, "requesting cal data\n");
+	hid_dbg(ctlr->hdev, "requesting cal data\n");
 
 	/* check if user stick calibrations are present */
-	if (!nx_con_check_for_cal_magic(con, NX_CON_CAL_USR_LEFT_MAGIC_ADDR)) {
-		left_stick_addr = NX_CON_CAL_USR_LEFT_DATA_ADDR;
-		hid_info(con->hdev, "using user cal for left stick\n");
+	if (!joycon_check_for_cal_magic(ctlr, JC_CAL_USR_LEFT_MAGIC_ADDR)) {
+		left_stick_addr = JC_CAL_USR_LEFT_DATA_ADDR;
+		hid_info(ctlr->hdev, "using user cal for left stick\n");
 	} else {
-		hid_info(con->hdev, "using factory cal for left stick\n");
+		hid_info(ctlr->hdev, "using factory cal for left stick\n");
 	}
-	if (!nx_con_check_for_cal_magic(con, NX_CON_CAL_USR_RIGHT_MAGIC_ADDR)) {
-		right_stick_addr = NX_CON_CAL_USR_RIGHT_DATA_ADDR;
-		hid_info(con->hdev, "using user cal for right stick\n");
+	if (!joycon_check_for_cal_magic(ctlr, JC_CAL_USR_RIGHT_MAGIC_ADDR)) {
+		right_stick_addr = JC_CAL_USR_RIGHT_DATA_ADDR;
+		hid_info(ctlr->hdev, "using user cal for right stick\n");
 	} else {
-		hid_info(con->hdev, "using factory cal for right stick\n");
+		hid_info(ctlr->hdev, "using factory cal for right stick\n");
 	}
 
-	if ((ret = nx_con_read_stick_calibration(con,
-						 left_stick_addr,
-					     	 &con->left_stick_cal_x,
-					     	 &con->left_stick_cal_y,
-					     	 true))) {
-		nx_con_use_default_calibration(con->hdev,
-					       &con->left_stick_cal_x,
-					       &con->left_stick_cal_y,
-					       "left",
-					       ret);
-	}
+	/* read the left stick calibration data */
+	ret = joycon_read_stick_calibration(ctlr, left_stick_addr,
+					    &ctlr->left_stick_cal_x,
+					    &ctlr->left_stick_cal_y,
+					    true);
 
-	if ((ret = nx_con_read_stick_calibration(con,
-						 right_stick_addr,
-						 &con->right_stick_cal_x,
-					         &con->right_stick_cal_y,
-					         false))) {
-		nx_con_use_default_calibration(con->hdev,
-					       &con->right_stick_cal_x,
-					       &con->right_stick_cal_y,
-					       "right",
-					       ret);
-	}
+	if (ret)
+		joycon_use_default_calibration(ctlr->hdev,
+					       &ctlr->left_stick_cal_x,
+					       &ctlr->left_stick_cal_y,
+					       "left", ret);
 
-	hid_dbg(con->hdev, "calibration:\n"
-			   "l_x_c=%d l_x_max=%d l_x_min=%d\n"
-			   "l_y_c=%d l_y_max=%d l_y_min=%d\n"
-			   "r_x_c=%d r_x_max=%d r_x_min=%d\n"
-			   "r_y_c=%d r_y_max=%d r_y_min=%d\n",
-			   con->left_stick_cal_x.center,
-			   con->left_stick_cal_x.max,
-			   con->left_stick_cal_x.min,
-			   con->left_stick_cal_y.center,
-			   con->left_stick_cal_y.max,
-			   con->left_stick_cal_y.min,
-			   con->right_stick_cal_x.center,
-			   con->right_stick_cal_x.max,
-			   con->right_stick_cal_x.min,
-			   con->right_stick_cal_y.center,
-			   con->right_stick_cal_y.max,
-			   con->right_stick_cal_y.min);
+	/* read the right stick calibration data */
+	ret = joycon_read_stick_calibration(ctlr, right_stick_addr,
+					    &ctlr->right_stick_cal_x,
+					    &ctlr->right_stick_cal_y,
+					    false);
+
+	if (ret)
+		joycon_use_default_calibration(ctlr->hdev,
+					       &ctlr->right_stick_cal_x,
+					       &ctlr->right_stick_cal_y,
+					       "right", ret);
+
+	hid_dbg(ctlr->hdev, "calibration:\n"
+			    "l_x_c=%d l_x_max=%d l_x_min=%d\n"
+			    "l_y_c=%d l_y_max=%d l_y_min=%d\n"
+			    "r_x_c=%d r_x_max=%d r_x_min=%d\n"
+			    "r_y_c=%d r_y_max=%d r_y_min=%d\n",
+			    ctlr->left_stick_cal_x.center,
+			    ctlr->left_stick_cal_x.max,
+			    ctlr->left_stick_cal_x.min,
+			    ctlr->left_stick_cal_y.center,
+			    ctlr->left_stick_cal_y.max,
+			    ctlr->left_stick_cal_y.min,
+			    ctlr->right_stick_cal_x.center,
+			    ctlr->right_stick_cal_x.max,
+			    ctlr->right_stick_cal_x.min,
+			    ctlr->right_stick_cal_y.center,
+			    ctlr->right_stick_cal_y.max,
+			    ctlr->right_stick_cal_y.min);
 
 	return 0;
 }
@@ -1128,51 +1216,66 @@ static int nx_con_request_calibration(struct nx_con *con)
  * dependent on the IMU calibration values. They are used when processing the
  * IMU input reports.
  */
-static void nx_con_calc_imu_cal_divisors(struct nx_con *con)
+static void joycon_calc_imu_cal_divisors(struct joycon_ctlr *ctlr)
 {
-	int i;
+	int i, divz = 0;
 
 	for (i = 0; i < 3; i++) {
-		con->imu_cal_accel_divisor[i] = con->accel_cal.scale[i] -
-						con->accel_cal.offset[i];
-		con->imu_cal_gyro_divisor[i] = con->gyro_cal.scale[i] -
-					       con->gyro_cal.offset[i];
+		ctlr->imu_cal_accel_divisor[i] = ctlr->accel_cal.scale[i] -
+						ctlr->accel_cal.offset[i];
+		ctlr->imu_cal_gyro_divisor[i] = ctlr->gyro_cal.scale[i] -
+						ctlr->gyro_cal.offset[i];
+
+		if (ctlr->imu_cal_accel_divisor[i] == 0) {
+			ctlr->imu_cal_accel_divisor[i] = 1;
+			divz++;
+		}
+
+		if (ctlr->imu_cal_gyro_divisor[i] == 0) {
+			ctlr->imu_cal_gyro_divisor[i] = 1;
+			divz++;
+		}
 	}
+
+	if (divz)
+		hid_warn(ctlr->hdev, "inaccurate IMU divisors (%d)\n", divz);
 }
 
 static const s16 DFLT_ACCEL_OFFSET /*= 0*/;
 static const s16 DFLT_ACCEL_SCALE = 16384;
 static const s16 DFLT_GYRO_OFFSET /*= 0*/;
 static const s16 DFLT_GYRO_SCALE  = 13371;
-
-static int nx_con_request_imu_calibration(struct nx_con *con)
+static int joycon_request_imu_calibration(struct joycon_ctlr *ctlr)
 {
-	u16 imu_cal_addr = NX_CON_IMU_CAL_FCT_DATA_ADDR;
+	u16 imu_cal_addr = JC_IMU_CAL_FCT_DATA_ADDR;
 	u8 *raw_cal;
 	int ret;
 	int i;
 
-	if (!nx_con_check_for_cal_magic(con, NX_CON_IMU_CAL_USR_MAGIC_ADDR)) {
-		imu_cal_addr = NX_CON_IMU_CAL_USR_DATA_ADDR;
-		hid_info(con->hdev, "using user cal for IMU\n");
+	/* check if user calibration exists */
+	if (!joycon_check_for_cal_magic(ctlr, JC_IMU_CAL_USR_MAGIC_ADDR)) {
+		imu_cal_addr = JC_IMU_CAL_USR_DATA_ADDR;
+		hid_info(ctlr->hdev, "using user cal for IMU\n");
 	} else {
-		hid_info(con->hdev, "using factory cal for IMU\n");
+		hid_info(ctlr->hdev, "using factory cal for IMU\n");
 	}
 
-	hid_dbg(con->hdev, "requesting IMU cal data\n");
-	if ((ret = nx_con_request_spi_flash_read(con,
-						 imu_cal_addr,
-						 NX_CON_IMU_CAL_DATA_SIZE,
-						 &raw_cal))) {
-		hid_warn(con->hdev, "Failed to read IMU cal, using defaults; ret=%d\n", ret);
+	/* request IMU calibration data */
+	hid_dbg(ctlr->hdev, "requesting IMU cal data\n");
+	ret = joycon_request_spi_flash_read(ctlr, imu_cal_addr,
+					    JC_IMU_CAL_DATA_SIZE, &raw_cal);
+	if (ret) {
+		hid_warn(ctlr->hdev,
+			 "Failed to read IMU cal, using defaults; ret=%d\n",
+			 ret);
 
 		for (i = 0; i < 3; i++) {
-			con->accel_cal.offset[i] = DFLT_ACCEL_OFFSET;
-			con->accel_cal.scale[i] = DFLT_ACCEL_SCALE;
-			con->gyro_cal.offset[i] = DFLT_GYRO_OFFSET;
-			con->gyro_cal.scale[i] = DFLT_GYRO_SCALE;
+			ctlr->accel_cal.offset[i] = DFLT_ACCEL_OFFSET;
+			ctlr->accel_cal.scale[i] = DFLT_ACCEL_SCALE;
+			ctlr->gyro_cal.offset[i] = DFLT_GYRO_OFFSET;
+			ctlr->gyro_cal.scale[i] = DFLT_GYRO_SCALE;
 		}
-		nx_con_calc_imu_cal_divisors(con);
+		joycon_calc_imu_cal_divisors(ctlr);
 		return ret;
 	}
 
@@ -1180,75 +1283,75 @@ static int nx_con_request_imu_calibration(struct nx_con *con)
 	for (i = 0; i < 3; i++) {
 		int j = i * 2;
 
-		con->accel_cal.offset[i] = get_unaligned_le16(raw_cal + j);
-		con->accel_cal.scale[i] = get_unaligned_le16(raw_cal + j + 6);
-		con->gyro_cal.offset[i] = get_unaligned_le16(raw_cal + j + 12);
-		con->gyro_cal.scale[i] = get_unaligned_le16(raw_cal + j + 18);
+		ctlr->accel_cal.offset[i] = get_unaligned_le16(raw_cal + j);
+		ctlr->accel_cal.scale[i] = get_unaligned_le16(raw_cal + j + 6);
+		ctlr->gyro_cal.offset[i] = get_unaligned_le16(raw_cal + j + 12);
+		ctlr->gyro_cal.scale[i] = get_unaligned_le16(raw_cal + j + 18);
 	}
 
-	nx_con_calc_imu_cal_divisors(con);
+	joycon_calc_imu_cal_divisors(ctlr);
 
-	hid_dbg(con->hdev, "IMU calibration:\n"
-			   "a_o[0]=%d a_o[1]=%d a_o[2]=%d\n"
-			   "a_s[0]=%d a_s[1]=%d a_s[2]=%d\n"
-			   "g_o[0]=%d g_o[1]=%d g_o[2]=%d\n"
-			   "g_s[0]=%d g_s[1]=%d g_s[2]=%d\n",
-			   con->accel_cal.offset[0],
-			   con->accel_cal.offset[1],
-			   con->accel_cal.offset[2],
-			   con->accel_cal.scale[0],
-			   con->accel_cal.scale[1],
-			   con->accel_cal.scale[2],
-			   con->gyro_cal.offset[0],
-			   con->gyro_cal.offset[1],
-			   con->gyro_cal.offset[2],
-			   con->gyro_cal.scale[0],
-			   con->gyro_cal.scale[1],
-			   con->gyro_cal.scale[2]);
+	hid_dbg(ctlr->hdev, "IMU calibration:\n"
+			    "a_o[0]=%d a_o[1]=%d a_o[2]=%d\n"
+			    "a_s[0]=%d a_s[1]=%d a_s[2]=%d\n"
+			    "g_o[0]=%d g_o[1]=%d g_o[2]=%d\n"
+			    "g_s[0]=%d g_s[1]=%d g_s[2]=%d\n",
+			    ctlr->accel_cal.offset[0],
+			    ctlr->accel_cal.offset[1],
+			    ctlr->accel_cal.offset[2],
+			    ctlr->accel_cal.scale[0],
+			    ctlr->accel_cal.scale[1],
+			    ctlr->accel_cal.scale[2],
+			    ctlr->gyro_cal.offset[0],
+			    ctlr->gyro_cal.offset[1],
+			    ctlr->gyro_cal.offset[2],
+			    ctlr->gyro_cal.scale[0],
+			    ctlr->gyro_cal.scale[1],
+			    ctlr->gyro_cal.scale[2]);
 
 	return 0;
 }
 
-static int nx_con_set_report_mode(struct nx_con *con)
+static int joycon_set_report_mode(struct joycon_ctlr *ctlr)
 {
-	struct nx_con_subcmd_request *req;
+	struct joycon_subcmd_request *req;
 	u8 buffer[sizeof(*req) + 1] = { 0 };
 
-	req = (struct nx_con_subcmd_request *)buffer;
-	req->subcmd_id = NX_CON_SUBCMD_SET_REPORT_MODE;
+	req = (struct joycon_subcmd_request *)buffer;
+	req->subcmd_id = JC_SUBCMD_SET_REPORT_MODE;
 	req->data[0] = 0x30; /* standard, full report mode */
 
-	hid_dbg(con->hdev, "setting controller report mode\n");
-	return nx_con_send_subcmd(con, req, 1, HZ);
+	hid_dbg(ctlr->hdev, "setting controller report mode\n");
+	return joycon_send_subcmd(ctlr, req, 1, HZ);
 }
 
-static int nx_con_enable_rumble(struct nx_con *con)
+static int joycon_enable_rumble(struct joycon_ctlr *ctlr)
 {
-	struct nx_con_subcmd_request *req;
+	struct joycon_subcmd_request *req;
 	u8 buffer[sizeof(*req) + 1] = { 0 };
 
-	req = (struct nx_con_subcmd_request *)buffer;
-	req->subcmd_id = NX_CON_SUBCMD_ENABLE_VIBRATION;
+	req = (struct joycon_subcmd_request *)buffer;
+	req->subcmd_id = JC_SUBCMD_ENABLE_VIBRATION;
 	req->data[0] = 0x01; /* note: 0x00 would disable */
 
-	hid_dbg(con->hdev, "enabling rumble\n");
-	return nx_con_send_subcmd(con, req, 1, HZ/4);
+	hid_dbg(ctlr->hdev, "enabling rumble\n");
+	return joycon_send_subcmd(ctlr, req, 1, HZ/4);
 }
 
-static int nx_con_enable_imu(struct nx_con *con)
+static int joycon_enable_imu(struct joycon_ctlr *ctlr)
 {
-	struct nx_con_subcmd_request *req;
+	struct joycon_subcmd_request *req;
 	u8 buffer[sizeof(*req) + 1] = { 0 };
 
-	req = (struct nx_con_subcmd_request *)buffer;
-	req->subcmd_id = NX_CON_SUBCMD_ENABLE_IMU;
+	req = (struct joycon_subcmd_request *)buffer;
+	req->subcmd_id = JC_SUBCMD_ENABLE_IMU;
 	req->data[0] = 0x01; /* note: 0x00 would disable */
 
-	hid_dbg(con->hdev, "enabling IMU\n");
-	return nx_con_send_subcmd(con, req, 1, HZ);
+	hid_dbg(ctlr->hdev, "enabling IMU\n");
+	return joycon_send_subcmd(ctlr, req, 1, HZ);
 }
 
-static s32 nx_con_map_stick_val(struct nx_con_stick_cal *cal, s32 val)
+static s32 joycon_map_stick_val(struct joycon_stick_cal *cal, s32 val)
 {
 	s32 center = cal->center;
 	s32 min = cal->min;
@@ -1256,27 +1359,25 @@ static s32 nx_con_map_stick_val(struct nx_con_stick_cal *cal, s32 val)
 	s32 new_val;
 
 	if (val > center) {
-		new_val = (val - center) * NX_CON_MAX_STICK_MAG;
+		new_val = (val - center) * JC_MAX_STICK_MAG;
 		new_val /= (max - center);
 	} else {
-		new_val = (center - val) * -NX_CON_MAX_STICK_MAG;
+		new_val = (center - val) * -JC_MAX_STICK_MAG;
 		new_val /= (center - min);
 	}
-	new_val = clamp(new_val,
-			(s32)-NX_CON_MAX_STICK_MAG,
-			(s32)NX_CON_MAX_STICK_MAG);
+	new_val = clamp(new_val, (s32)-JC_MAX_STICK_MAG, (s32)JC_MAX_STICK_MAG);
 	return new_val;
 }
 
-static void nx_con_input_report_parse_imu_data(struct nx_con *con,
-					       struct nx_con_input_report *rep,
-					       struct nx_con_imu_data *imu_data)
+static void joycon_input_report_parse_imu_data(struct joycon_ctlr *ctlr,
+					       struct joycon_input_report *rep,
+					       struct joycon_imu_data *imu_data)
 {
 	u8 *raw = rep->imu_raw_bytes;
 	int i;
 
 	for (i = 0; i < 3; i++) {
-		struct nx_con_imu_data *data = &imu_data[i];
+		struct joycon_imu_data *data = &imu_data[i];
 
 		data->accel_x = get_unaligned_le16(raw + 0);
 		data->accel_y = get_unaligned_le16(raw + 2);
@@ -1285,20 +1386,21 @@ static void nx_con_input_report_parse_imu_data(struct nx_con *con,
 		data->gyro_y = get_unaligned_le16(raw + 8);
 		data->gyro_z = get_unaligned_le16(raw + 10);
 		/* point to next imu sample */
-		raw += sizeof(struct nx_con_imu_data);
+		raw += sizeof(struct joycon_imu_data);
 	}
 }
 
-static void nx_con_report_imu(struct nx_con *con, struct nx_con_input_report *rep)
+static void joycon_parse_imu_report(struct joycon_ctlr *ctlr,
+				    struct joycon_input_report *rep)
 {
-	struct nx_con_imu_data imu_data[3] = {0}; /* 3 reports per packet */
-	struct input_dev *idev = con->imu_idev;
+	struct joycon_imu_data imu_data[3] = {0}; /* 3 reports per packet */
+	struct input_dev *idev = ctlr->imu_input;
 	unsigned int msecs = jiffies_to_msecs(jiffies);
-	unsigned int last_msecs = con->imu_last_pkt_ms;
+	unsigned int last_msecs = ctlr->imu_last_pkt_ms;
 	int i;
 	int value[6];
 
-	nx_con_input_report_parse_imu_data(con, rep, imu_data);
+	joycon_input_report_parse_imu_data(ctlr, rep, imu_data);
 
 	/*
 	 * There are complexities surrounding how we determine the timestamps we
@@ -1347,67 +1449,65 @@ static void nx_con_report_imu(struct nx_con *con, struct nx_con_input_report *re
 	 * packet. The userspace timestamp for the samples will be adjusted
 	 * accordingly to prevent unwanted behvaior.
 	 */
-	if (!con->imu_first_packet_received) {
-		con->imu_timestamp_us = 0;
-		con->imu_delta_samples_count = 0;
-		con->imu_delta_samples_sum = 0;
-		con->imu_avg_delta_ms = NX_CON_IMU_DFLT_AVG_DELTA_MS;
-		con->imu_first_packet_received = true;
+	if (!ctlr->imu_first_packet_received) {
+		ctlr->imu_timestamp_us = 0;
+		ctlr->imu_delta_samples_count = 0;
+		ctlr->imu_delta_samples_sum = 0;
+		ctlr->imu_avg_delta_ms = JC_IMU_DFLT_AVG_DELTA_MS;
+		ctlr->imu_first_packet_received = true;
 	} else {
 		unsigned int delta = msecs - last_msecs;
 		unsigned int dropped_pkts;
 		unsigned int dropped_threshold;
 
 		/* avg imu report delta housekeeping */
-		con->imu_delta_samples_sum += delta;
-		con->imu_delta_samples_count++;
+		ctlr->imu_delta_samples_sum += delta;
+		ctlr->imu_delta_samples_count++;
+		if (ctlr->imu_delta_samples_count >=
+		    JC_IMU_SAMPLES_PER_DELTA_AVG) {
+			ctlr->imu_avg_delta_ms = ctlr->imu_delta_samples_sum /
+						 ctlr->imu_delta_samples_count;
+			ctlr->imu_delta_samples_count = 0;
+			ctlr->imu_delta_samples_sum = 0;
+		}
 
-		if (con->imu_delta_samples_count >= NX_CON_IMU_SAMPLES_PER_DELTA_AVG) {
-			con->imu_avg_delta_ms = con->imu_delta_samples_sum /
-						con->imu_delta_samples_count;
-			/* don't ever want divide by zero shenanigans */
-			if (con->imu_avg_delta_ms == 0) {
-				con->imu_avg_delta_ms = 1;
-				hid_warn(con->hdev, "calculated avg imu delta of 0\n");
-			}
-			con->imu_delta_samples_count = 0;
-			con->imu_delta_samples_sum = 0;
+		/* don't ever want divide by zero shenanigans */
+		if (ctlr->imu_avg_delta_ms == 0) {
+			ctlr->imu_avg_delta_ms = 1;
+			hid_warn(ctlr->hdev, "calculated avg imu delta of 0\n");
 		}
 
 		/* useful for debugging IMU sample rate */
-		hid_dbg(con->hdev,
+		hid_dbg(ctlr->hdev,
 			"imu_report: ms=%u last_ms=%u delta=%u avg_delta=%u\n",
-			msecs,
-			last_msecs,
-			delta,
-			con->imu_avg_delta_ms);
+			msecs, last_msecs, delta, ctlr->imu_avg_delta_ms);
 
 		/* check if any packets have been dropped */
-		dropped_threshold = con->imu_avg_delta_ms * 3 / 2;
+		dropped_threshold = ctlr->imu_avg_delta_ms * 3 / 2;
 		dropped_pkts = (delta - min(delta, dropped_threshold)) /
-				con->imu_avg_delta_ms;
-		con->imu_timestamp_us += 1000 * con->imu_avg_delta_ms;
-		if (dropped_pkts > NX_CON_IMU_DROPPED_PKT_WARNING) {
-			hid_warn(con->hdev,
+				ctlr->imu_avg_delta_ms;
+		ctlr->imu_timestamp_us += 1000 * ctlr->imu_avg_delta_ms;
+		if (dropped_pkts > JC_IMU_DROPPED_PKT_WARNING) {
+			hid_warn(ctlr->hdev,
 				 "compensating for %u dropped IMU reports\n",
 				 dropped_pkts);
-			hid_warn(con->hdev,
+			hid_warn(ctlr->hdev,
 				 "delta=%u avg_delta=%u\n",
-				 delta,
-				 con->imu_avg_delta_ms);
+				 delta, ctlr->imu_avg_delta_ms);
 		}
 	}
-	con->imu_last_pkt_ms = msecs;
+	ctlr->imu_last_pkt_ms = msecs;
 
 	/* Each IMU input report contains three samples */
 	for (i = 0; i < 3; i++) {
-		input_event(idev, EV_MSC, MSC_TIMESTAMP, con->imu_timestamp_us);
+		input_event(idev, EV_MSC, MSC_TIMESTAMP,
+			    ctlr->imu_timestamp_us);
 
 		/*
 		 * These calculations (which use the controller's calibration
 		 * settings to improve the final values) are based on those
 		 * found in the community's reverse-engineering repo (linked at
-		 * top of driver). For hid-nx, we make sure that the final
+		 * top of driver). For hid-nintendo, we make sure that the final
 		 * value given to userspace is always in terms of the axis
 		 * resolution we provided.
 		 *
@@ -1421,41 +1521,37 @@ static void nx_con_report_imu(struct nx_con *con, struct nx_con_input_report *re
 		 * otherwise occur. To prevent overflow (without resorting to 64
 		 * bit integer math), the mult_frac macro is used.
 		 */
-		value[0] = mult_frac((NX_CON_IMU_PREC_RANGE_SCALE *
+		value[0] = mult_frac((JC_IMU_PREC_RANGE_SCALE *
 				      (imu_data[i].gyro_x -
-				       con->gyro_cal.offset[0])),
-				     con->gyro_cal.scale[0],
-				     con->imu_cal_gyro_divisor[0]);
-		value[1] = mult_frac((NX_CON_IMU_PREC_RANGE_SCALE *
+				       ctlr->gyro_cal.offset[0])),
+				     ctlr->gyro_cal.scale[0],
+				     ctlr->imu_cal_gyro_divisor[0]);
+		value[1] = mult_frac((JC_IMU_PREC_RANGE_SCALE *
 				      (imu_data[i].gyro_y -
-				       con->gyro_cal.offset[1])),
-				     con->gyro_cal.scale[1],
-				     con->imu_cal_gyro_divisor[1]);
-		value[2] = mult_frac((NX_CON_IMU_PREC_RANGE_SCALE *
+				       ctlr->gyro_cal.offset[1])),
+				     ctlr->gyro_cal.scale[1],
+				     ctlr->imu_cal_gyro_divisor[1]);
+		value[2] = mult_frac((JC_IMU_PREC_RANGE_SCALE *
 				      (imu_data[i].gyro_z -
-				       con->gyro_cal.offset[2])),
-				     con->gyro_cal.scale[2],
-				     con->imu_cal_gyro_divisor[2]);
+				       ctlr->gyro_cal.offset[2])),
+				     ctlr->gyro_cal.scale[2],
+				     ctlr->imu_cal_gyro_divisor[2]);
 
 		value[3] = ((s32)imu_data[i].accel_x *
-			    con->accel_cal.scale[0]) /
-			    con->imu_cal_accel_divisor[0];
+			    ctlr->accel_cal.scale[0]) /
+			    ctlr->imu_cal_accel_divisor[0];
 		value[4] = ((s32)imu_data[i].accel_y *
-			    con->accel_cal.scale[1]) /
-			    con->imu_cal_accel_divisor[1];
+			    ctlr->accel_cal.scale[1]) /
+			    ctlr->imu_cal_accel_divisor[1];
 		value[5] = ((s32)imu_data[i].accel_z *
-			    con->accel_cal.scale[2]) /
-			    con->imu_cal_accel_divisor[2];
+			    ctlr->accel_cal.scale[2]) /
+			    ctlr->imu_cal_accel_divisor[2];
 
-		hid_dbg(con->hdev,
-			"raw_gyro: g_x=%d g_y=%d g_z=%d\n",
-			imu_data[i].gyro_x,
-			imu_data[i].gyro_y,
+		hid_dbg(ctlr->hdev, "raw_gyro: g_x=%d g_y=%d g_z=%d\n",
+			imu_data[i].gyro_x, imu_data[i].gyro_y,
 			imu_data[i].gyro_z);
-		hid_dbg(con->hdev,
-			"raw_accel: a_x=%d a_y=%d a_z=%d\n",
-			imu_data[i].accel_x,
-			imu_data[i].accel_y,
+		hid_dbg(ctlr->hdev, "raw_accel: a_x=%d a_y=%d a_z=%d\n",
+			imu_data[i].accel_x, imu_data[i].accel_y,
 			imu_data[i].accel_z);
 
 		/*
@@ -1468,7 +1564,7 @@ static void nx_con_report_imu(struct nx_con *con, struct nx_con_input_report *re
 		 *   Z: positive is pointing up (out of the buttons/sticks)
 		 * The axes follow the right-hand rule.
 		 */
-		if (nx_con_type_is_right_joycon(con)) {
+		if (jc_type_is_joycon(ctlr) && jc_type_has_right(ctlr)) {
 			int j;
 
 			/* negate all but x axis */
@@ -1486,263 +1582,294 @@ static void nx_con_report_imu(struct nx_con *con, struct nx_con_input_report *re
 		input_report_abs(idev, ABS_Y, value[4]);
 		input_report_abs(idev, ABS_Z, value[5]);
 		input_sync(idev);
-
 		/* convert to micros and divide by 3 (3 samples per report). */
-		con->imu_timestamp_us += con->imu_avg_delta_ms * 1000 / 3;
+		ctlr->imu_timestamp_us += ctlr->imu_avg_delta_ms * 1000 / 3;
 	}
 }
 
-static void nx_con_handle_rumble_report(struct nx_con *con, struct nx_con_input_report *rep)
+static void joycon_handle_rumble_report(struct joycon_ctlr *ctlr, struct joycon_input_report *rep)
 {
 	unsigned long flags;
 	unsigned long msecs = jiffies_to_msecs(jiffies);
 
-	spin_lock_irqsave(&con->lock, flags);
-
+	spin_lock_irqsave(&ctlr->lock, flags);
 	if (IS_ENABLED(CONFIG_NINTENDO_FF) && rep->vibrator_report &&
-	    (msecs - con->rumble_msecs) >= NX_CON_RUMBLE_PERIOD_MS &&
-	    (con->rumble_queue_head != con->rumble_queue_tail ||
-	     con->rumble_zero_countdown > 0)) {
+	    ctlr->ctlr_state != JOYCON_CTLR_STATE_REMOVED &&
+	    (msecs - ctlr->rumble_msecs) >= JC_RUMBLE_PERIOD_MS &&
+	    (ctlr->rumble_queue_head != ctlr->rumble_queue_tail ||
+	     ctlr->rumble_zero_countdown > 0)) {
 		/*
 		 * When this value reaches 0, we know we've sent multiple
 		 * packets to the controller instructing it to disable rumble.
 		 * We can safely stop sending periodic rumble packets until the
 		 * next ff effect.
 		 */
-		if (con->rumble_zero_countdown > 0)
-			con->rumble_zero_countdown--;
-		queue_work(con->rumble_queue, &con->rumble_worker);
+		if (ctlr->rumble_zero_countdown > 0)
+			ctlr->rumble_zero_countdown--;
+		queue_work(ctlr->rumble_queue, &ctlr->rumble_worker);
 	}
 
-	spin_unlock_irqrestore(&con->lock, flags);
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 }
 
-static void nx_con_parse_battery_status(struct nx_con *con, struct nx_con_input_report *rep)
+static void joycon_parse_battery_status(struct joycon_ctlr *ctlr, struct joycon_input_report *rep)
 {
 	u8 tmp;
 	unsigned long flags;
 
-	spin_lock_irqsave(&con->lock, flags);
+	spin_lock_irqsave(&ctlr->lock, flags);
 
 	tmp = rep->bat_con;
-	con->host_powered = tmp & BIT(0);
-	con->battery_charging = tmp & BIT(4);
+	ctlr->host_powered = tmp & BIT(0);
+	ctlr->battery_charging = tmp & BIT(4);
 	tmp = tmp >> 5;
 
 	switch (tmp) {
 	case 0: /* empty */
-		con->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+		ctlr->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
 		break;
 	case 1: /* low */
-		con->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
+		ctlr->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
 		break;
 	case 2: /* medium */
-		con->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+		ctlr->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
 		break;
 	case 3: /* high */
-		con->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
+		ctlr->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_HIGH;
 		break;
 	case 4: /* full */
-		con->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
+		ctlr->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
 		break;
 	default:
-		con->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
-		hid_warn(con->hdev, "Invalid battery status\n");
+		ctlr->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
+		hid_warn(ctlr->hdev, "Invalid battery status\n");
 		break;
 	}
 
-	spin_unlock_irqrestore(&con->lock, flags);
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 }
 
-static void nx_con_report_left_stick(struct nx_con *con,
-				     struct nx_con_input_report *rep)
+static void joycon_report_left_stick(struct joycon_ctlr *ctlr,
+				     struct joycon_input_report *rep)
 {
 	u16 raw_x;
 	u16 raw_y;
 	s32 x;
 	s32 y;
 
-	raw_x = hid_field_extract(con->hdev, rep->left_stick, 0, 12);
-	raw_y = hid_field_extract(con->hdev, rep->left_stick + 1, 4, 12);
+	raw_x = hid_field_extract(ctlr->hdev, rep->left_stick, 0, 12);
+	raw_y = hid_field_extract(ctlr->hdev, rep->left_stick + 1, 4, 12);
 
-	x = nx_con_map_stick_val(&con->left_stick_cal_x, raw_x);
-	y = -nx_con_map_stick_val(&con->left_stick_cal_y, raw_y);
+	x = joycon_map_stick_val(&ctlr->left_stick_cal_x, raw_x);
+	y = -joycon_map_stick_val(&ctlr->left_stick_cal_y, raw_y);
 
-	input_report_abs(con->idev, ABS_X, x);
-	input_report_abs(con->idev, ABS_Y, y);
+	input_report_abs(ctlr->input, ABS_X, x);
+	input_report_abs(ctlr->input, ABS_Y, y);
 }
 
-static void nx_con_report_right_stick(struct nx_con *con,
-				      struct nx_con_input_report *rep)
+static void joycon_report_right_stick(struct joycon_ctlr *ctlr,
+				      struct joycon_input_report *rep)
 {
 	u16 raw_x;
 	u16 raw_y;
 	s32 x;
 	s32 y;
 
-	raw_x = hid_field_extract(con->hdev, rep->right_stick, 0, 12);
-	raw_y = hid_field_extract(con->hdev, rep->right_stick + 1, 4, 12);
+	raw_x = hid_field_extract(ctlr->hdev, rep->right_stick, 0, 12);
+	raw_y = hid_field_extract(ctlr->hdev, rep->right_stick + 1, 4, 12);
 
-	x = nx_con_map_stick_val(&con->right_stick_cal_x, raw_x);
-	y = -nx_con_map_stick_val(&con->right_stick_cal_y, raw_y);
+	x = joycon_map_stick_val(&ctlr->right_stick_cal_x, raw_x);
+	y = -joycon_map_stick_val(&ctlr->right_stick_cal_y, raw_y);
 
-	input_report_abs(con->idev, ABS_RX, x);
-	input_report_abs(con->idev, ABS_RY, y);
+	input_report_abs(ctlr->input, ABS_RX, x);
+	input_report_abs(ctlr->input, ABS_RY, y);
 }
 
-static void nx_con_report_dpad(struct nx_con *con,
-			       struct nx_con_input_report *rep)
+static void joycon_report_dpad(struct joycon_ctlr *ctlr,
+			       struct joycon_input_report *rep)
 {
 	int hatx = 0;
 	int haty = 0;
-	u32 btns = hid_field_extract(con->hdev, rep->button_status, 0, 24);
+	u32 btns = hid_field_extract(ctlr->hdev, rep->button_status, 0, 24);
 
-	if (btns & NX_CON_BTN_LEFT)
+	if (btns & JC_BTN_LEFT)
 		hatx = -1;
-	else if (btns & NX_CON_BTN_RIGHT)
+	else if (btns & JC_BTN_RIGHT)
 		hatx = 1;
 
-	if (btns & NX_CON_BTN_UP)
+	if (btns & JC_BTN_UP)
 		haty = -1;
-	else if (btns & NX_CON_BTN_DOWN)
+	else if (btns & JC_BTN_DOWN)
 		haty = 1;
 
-	input_report_abs(con->idev, ABS_HAT0X, hatx);
-	input_report_abs(con->idev, ABS_HAT0Y, haty);
+	input_report_abs(ctlr->input, ABS_HAT0X, hatx);
+	input_report_abs(ctlr->input, ABS_HAT0Y, haty);
 }
 
-static void nx_con_report_buttons(struct nx_con *con,
-				  struct nx_con_input_report *rep,
-				  const struct nx_con_button_mapping button_mappings[])
+static void joycon_report_buttons(struct joycon_ctlr *ctlr,
+				  struct joycon_input_report *rep,
+				  const struct joycon_ctlr_button_mapping button_mappings[])
 {
-	const struct nx_con_button_mapping *button;
-	u32 status = hid_field_extract(con->hdev, rep->button_status, 0, 24);
+	const struct joycon_ctlr_button_mapping *button;
+	u32 status = hid_field_extract(ctlr->hdev, rep->button_status, 0, 24);
 
 	for (button = button_mappings; button->code; button++)
-		input_report_key(con->idev, button->code, status & button->bit);
+		input_report_key(ctlr->input, button->code, status & button->bit);
 }
 
-static void nx_con_parse_report(struct nx_con *con, struct nx_con_input_report *rep)
+static void joycon_parse_report(struct joycon_ctlr *ctlr,
+				struct joycon_input_report *rep)
 {
 	unsigned long flags;
+	unsigned long msecs = jiffies_to_msecs(jiffies);
+	unsigned long report_delta_ms = msecs - ctlr->last_input_report_msecs;
 
-	if (nx_con_has_rumble(con))
-		nx_con_handle_rumble_report(con, rep);
+	if (joycon_has_rumble(ctlr))
+		joycon_handle_rumble_report(ctlr, rep);
 
-	nx_con_parse_battery_status(con, rep);
+	joycon_parse_battery_status(ctlr, rep);
 
-	if (rep->id == NX_CON_INPUT_IMU_DATA && nx_con_has_imu(con))
-		nx_con_report_imu(con, rep);
-
-	if (nx_con_type_is_left_joycon(con)) {
-		nx_con_report_left_stick(con, rep);
-		nx_con_report_buttons(con, rep, left_joycon_button_mappings);
-		if (!nx_con_device_is_chrggrip(con))
-			nx_con_report_buttons(con, rep, left_joycon_s_button_mappings);
-	} else if (nx_con_type_is_right_joycon(con)) {
-		nx_con_report_right_stick(con, rep);
-		nx_con_report_buttons(con, rep, right_joycon_button_mappings);
-		if (!nx_con_device_is_chrggrip(con))
-			nx_con_report_buttons(con, rep, right_joycon_s_button_mappings);
-	} else if (nx_con_type_is_procon(con)) {
-		nx_con_report_left_stick(con, rep);
-		nx_con_report_right_stick(con, rep);
-		nx_con_report_dpad(con, rep);
-		nx_con_report_buttons(con, rep, procon_button_mappings);
-	} else if (nx_con_type_is_any_nescon(con)) {
-		nx_con_report_dpad(con, rep);
-		nx_con_report_buttons(con, rep, nescon_button_mappings);
-	} else if (nx_con_type_is_snescon(con)) {
-		nx_con_report_dpad(con, rep);
-		nx_con_report_buttons(con, rep, snescon_button_mappings);
-	} else if (nx_con_type_is_gencon(con)) {
-		nx_con_report_dpad(con, rep);
-		nx_con_report_buttons(con, rep, gencon_button_mappings);
-	} else if (nx_con_type_is_n64con(con)) {
-		nx_con_report_left_stick(con, rep);
-		nx_con_report_dpad(con, rep);
-		nx_con_report_buttons(con, rep, n64con_button_mappings);
+	if (joycon_type_is_left_joycon(ctlr)) {
+		joycon_report_left_stick(ctlr, rep);
+		joycon_report_buttons(ctlr, rep, left_joycon_button_mappings);
+		if (!joycon_device_is_chrggrip(ctlr))
+			joycon_report_buttons(ctlr, rep, left_joycon_s_button_mappings);
+	} else if (joycon_type_is_right_joycon(ctlr)) {
+		joycon_report_right_stick(ctlr, rep);
+		joycon_report_buttons(ctlr, rep, right_joycon_button_mappings);
+		if (!joycon_device_is_chrggrip(ctlr))
+			joycon_report_buttons(ctlr, rep, right_joycon_s_button_mappings);
+	} else if (joycon_type_is_procon(ctlr)) {
+		joycon_report_left_stick(ctlr, rep);
+		joycon_report_right_stick(ctlr, rep);
+		joycon_report_dpad(ctlr, rep);
+		joycon_report_buttons(ctlr, rep, procon_button_mappings);
+	} else if (joycon_type_is_any_nescon(ctlr)) {
+		joycon_report_dpad(ctlr, rep);
+		joycon_report_buttons(ctlr, rep, nescon_button_mappings);
+	} else if (joycon_type_is_snescon(ctlr)) {
+		joycon_report_dpad(ctlr, rep);
+		joycon_report_buttons(ctlr, rep, snescon_button_mappings);
+	} else if (joycon_type_is_gencon(ctlr)) {
+		joycon_report_dpad(ctlr, rep);
+		joycon_report_buttons(ctlr, rep, gencon_button_mappings);
+	} else if (joycon_type_is_n64con(ctlr)) {
+		joycon_report_left_stick(ctlr, rep);
+		joycon_report_dpad(ctlr, rep);
+		joycon_report_buttons(ctlr, rep, n64con_button_mappings);
 	}
 
-	input_sync(con->idev);
+	input_sync(ctlr->input);
+
+	spin_lock_irqsave(&ctlr->lock, flags);
+	ctlr->last_input_report_msecs = msecs;
+	/*
+	 * Was this input report a reasonable time delta compared to the prior
+	 * report? We use this information to decide when a safe time is to send
+	 * rumble packets or subcommand packets.
+	 */
+	if (report_delta_ms >= JC_INPUT_REPORT_MIN_DELTA &&
+	    report_delta_ms <= JC_INPUT_REPORT_MAX_DELTA) {
+		if (ctlr->consecutive_valid_report_deltas < JC_SUBCMD_VALID_DELTA_REQ)
+			ctlr->consecutive_valid_report_deltas++;
+	} else {
+		ctlr->consecutive_valid_report_deltas = 0;
+	}
+	/*
+	 * Our consecutive valid report tracking is only relevant for
+	 * bluetooth-connected controllers. For USB devices, we're beholden to
+	 * USB's underlying polling rate anyway. Always set to the consecutive
+	 * delta requirement.
+	 */
+	if (ctlr->hdev->bus == BUS_USB)
+		ctlr->consecutive_valid_report_deltas = JC_SUBCMD_VALID_DELTA_REQ;
+
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 
 	/*
 	 * Immediately after receiving a report is the most reliable time to
 	 * send a subcommand to the controller. Wake any subcommand senders
 	 * waiting for a report.
 	 */
-	if (unlikely(mutex_is_locked(&con->output_mutex))) {
-		spin_lock_irqsave(&con->lock, flags);
-		con->received_input_report = true;
-		spin_unlock_irqrestore(&con->lock, flags);
-		wake_up(&con->wait);
+	if (unlikely(mutex_is_locked(&ctlr->output_mutex))) {
+		spin_lock_irqsave(&ctlr->lock, flags);
+		ctlr->received_input_report = true;
+		spin_unlock_irqrestore(&ctlr->lock, flags);
+		wake_up(&ctlr->wait);
 	}
+
+	/* parse IMU data if present */
+	if ((rep->id == JC_INPUT_IMU_DATA) && joycon_has_imu(ctlr))
+		joycon_parse_imu_report(ctlr, rep);
 }
 
-static int nx_con_send_rumble_data(struct nx_con *con)
+static int joycon_send_rumble_data(struct joycon_ctlr *ctlr)
 {
+	int ret;
 	unsigned long flags;
-	struct nx_con_rumble_output rumble_output = { 0 };
+	struct joycon_rumble_output rumble_output = { 0 };
 
-	spin_lock_irqsave(&con->lock, flags);
+	spin_lock_irqsave(&ctlr->lock, flags);
 	/*
 	 * If the controller has been removed, just return ENODEV so the LED
 	 * subsystem doesn't print invalid errors on removal.
 	 */
-	if (con->state == NX_CON_STATE_REMOVED) {
-		spin_unlock_irqrestore(&con->lock, flags);
+	if (ctlr->ctlr_state == JOYCON_CTLR_STATE_REMOVED) {
+		spin_unlock_irqrestore(&ctlr->lock, flags);
 		return -ENODEV;
 	}
 	memcpy(rumble_output.rumble_data,
-	       con->rumble_data[con->rumble_queue_tail],
-	       NX_CON_RUMBLE_DATA_SIZE);
-	spin_unlock_irqrestore(&con->lock, flags);
+	       ctlr->rumble_data[ctlr->rumble_queue_tail],
+	       JC_RUMBLE_DATA_SIZE);
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 
-	rumble_output.output_id = NX_CON_OUTPUT_RUMBLE_ONLY;
-	rumble_output.packet_num = con->subcmd_num;
-	if (++con->subcmd_num > 0xF)
-		con->subcmd_num = 0;
+	rumble_output.output_id = JC_OUTPUT_RUMBLE_ONLY;
+	rumble_output.packet_num = ctlr->subcmd_num;
+	if (++ctlr->subcmd_num > 0xF)
+		ctlr->subcmd_num = 0;
 
-	nx_con_enforce_subcmd_rate(con);
+	joycon_enforce_subcmd_rate(ctlr);
 
-	return __nx_con_hid_send(con->hdev,
-				 (u8 *)&rumble_output,
-				 sizeof(rumble_output));
+	ret = __joycon_hid_send(ctlr->hdev, (u8 *)&rumble_output,
+				sizeof(rumble_output));
+	return ret;
 }
 
-static void nx_con_rumble_worker(struct work_struct *work)
+static void joycon_rumble_worker(struct work_struct *work)
 {
-	struct nx_con *con = container_of(work, struct nx_con, rumble_worker);
+	struct joycon_ctlr *ctlr = container_of(work, struct joycon_ctlr,
+							rumble_worker);
 	unsigned long flags;
 	bool again = true;
 	int ret;
 
 	while (again) {
-		mutex_lock(&con->output_mutex);
-		ret = nx_con_send_rumble_data(con);
-		mutex_unlock(&con->output_mutex);
+		mutex_lock(&ctlr->output_mutex);
+		ret = joycon_send_rumble_data(ctlr);
+		mutex_unlock(&ctlr->output_mutex);
 
 		/* -ENODEV means the controller was just unplugged */
-		spin_lock_irqsave(&con->lock, flags);
-		if (ret < 0 && ret != -ENODEV && con->state != NX_CON_STATE_REMOVED)
-			hid_warn(con->hdev, "Failed to set rumble; e=%d", ret);
+		spin_lock_irqsave(&ctlr->lock, flags);
+		if (ret < 0 && ret != -ENODEV &&
+		    ctlr->ctlr_state != JOYCON_CTLR_STATE_REMOVED)
+			hid_warn(ctlr->hdev, "Failed to set rumble; e=%d", ret);
 
-		con->rumble_msecs = jiffies_to_msecs(jiffies);
-		if (con->rumble_queue_tail != con->rumble_queue_head) {
-			if (++con->rumble_queue_tail >= NX_CON_RUMBLE_QUEUE_SIZE)
-				con->rumble_queue_tail = 0;
+		ctlr->rumble_msecs = jiffies_to_msecs(jiffies);
+		if (ctlr->rumble_queue_tail != ctlr->rumble_queue_head) {
+			if (++ctlr->rumble_queue_tail >= JC_RUMBLE_QUEUE_SIZE)
+				ctlr->rumble_queue_tail = 0;
 		} else {
 			again = false;
 		}
-		spin_unlock_irqrestore(&con->lock, flags);
+		spin_unlock_irqrestore(&ctlr->lock, flags);
 	}
 }
 
 #if IS_ENABLED(CONFIG_NINTENDO_FF)
-static struct nx_con_rumble_freq_data nx_con_find_rumble_freq(u16 freq)
+static struct joycon_rumble_freq_data joycon_find_rumble_freq(u16 freq)
 {
-	const size_t length = ARRAY_SIZE(nx_con_rumble_frequencies);
-	const struct nx_con_rumble_freq_data *data = nx_con_rumble_frequencies;
+	const size_t length = ARRAY_SIZE(joycon_rumble_frequencies);
+	const struct joycon_rumble_freq_data *data = joycon_rumble_frequencies;
 	int i = 0;
 
 	if (freq > data[0].freq) {
@@ -1755,10 +1882,10 @@ static struct nx_con_rumble_freq_data nx_con_find_rumble_freq(u16 freq)
 	return data[i];
 }
 
-static struct nx_con_rumble_amp_data nx_con_find_rumble_amp(u16 amp)
+static struct joycon_rumble_amp_data joycon_find_rumble_amp(u16 amp)
 {
-	const size_t length = ARRAY_SIZE(nx_con_rumble_amplitudes);
-	const struct nx_con_rumble_amp_data *data = nx_con_rumble_amplitudes;
+	const size_t length = ARRAY_SIZE(joycon_rumble_amplitudes);
+	const struct joycon_rumble_amp_data *data = joycon_rumble_amplitudes;
 	int i = 0;
 
 	if (amp > data[0].amp) {
@@ -1771,15 +1898,15 @@ static struct nx_con_rumble_amp_data nx_con_find_rumble_amp(u16 amp)
 	return data[i];
 }
 
-static void nx_con_encode_rumble(u8 *data, u16 freq_low, u16 freq_high, u16 amp)
+static void joycon_encode_rumble(u8 *data, u16 freq_low, u16 freq_high, u16 amp)
 {
-	struct nx_con_rumble_freq_data freq_data_low;
-	struct nx_con_rumble_freq_data freq_data_high;
-	struct nx_con_rumble_amp_data amp_data;
+	struct joycon_rumble_freq_data freq_data_low;
+	struct joycon_rumble_freq_data freq_data_high;
+	struct joycon_rumble_amp_data amp_data;
 
-	freq_data_low = nx_con_find_rumble_freq(freq_low);
-	freq_data_high = nx_con_find_rumble_freq(freq_high);
-	amp_data = nx_con_find_rumble_amp(amp);
+	freq_data_low = joycon_find_rumble_freq(freq_low);
+	freq_data_high = joycon_find_rumble_freq(freq_high);
+	amp_data = joycon_find_rumble_amp(amp);
 
 	data[0] = (freq_data_high.high >> 8) & 0xFF;
 	data[1] = (freq_data_high.high & 0xFF) + amp_data.high;
@@ -1787,477 +1914,467 @@ static void nx_con_encode_rumble(u8 *data, u16 freq_low, u16 freq_high, u16 amp)
 	data[3] = amp_data.low & 0xFF;
 }
 
-static const u16 NX_CON_MAX_RUMBLE_HIGH_FREQ	= 1253;
-static const u16 NX_CON_MIN_RUMBLE_HIGH_FREQ	= 82;
-static const u16 NX_CON_MAX_RUMBLE_LOW_FREQ	= 626;
-static const u16 NX_CON_MIN_RUMBLE_LOW_FREQ	= 41;
+static const u16 JOYCON_MAX_RUMBLE_HIGH_FREQ	= 1253;
+static const u16 JOYCON_MIN_RUMBLE_HIGH_FREQ	= 82;
+static const u16 JOYCON_MAX_RUMBLE_LOW_FREQ	= 626;
+static const u16 JOYCON_MIN_RUMBLE_LOW_FREQ	= 41;
 
-static void nx_con_clamp_rumble_freqs(struct nx_con *con)
+static void joycon_clamp_rumble_freqs(struct joycon_ctlr *ctlr)
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(&con->lock, flags);
-	con->rumble_ll_freq = clamp(con->rumble_ll_freq,
-				    NX_CON_MIN_RUMBLE_LOW_FREQ,
-				    NX_CON_MAX_RUMBLE_LOW_FREQ);
-	con->rumble_lh_freq = clamp(con->rumble_lh_freq,
-				    NX_CON_MIN_RUMBLE_HIGH_FREQ,
-				    NX_CON_MAX_RUMBLE_HIGH_FREQ);
-	con->rumble_rl_freq = clamp(con->rumble_rl_freq,
-				    NX_CON_MIN_RUMBLE_LOW_FREQ,
-				    NX_CON_MAX_RUMBLE_LOW_FREQ);
-	con->rumble_rh_freq = clamp(con->rumble_rh_freq,
-				    NX_CON_MIN_RUMBLE_HIGH_FREQ,
-				    NX_CON_MAX_RUMBLE_HIGH_FREQ);
-	spin_unlock_irqrestore(&con->lock, flags);
+	spin_lock_irqsave(&ctlr->lock, flags);
+	ctlr->rumble_ll_freq = clamp(ctlr->rumble_ll_freq,
+				     JOYCON_MIN_RUMBLE_LOW_FREQ,
+				     JOYCON_MAX_RUMBLE_LOW_FREQ);
+	ctlr->rumble_lh_freq = clamp(ctlr->rumble_lh_freq,
+				     JOYCON_MIN_RUMBLE_HIGH_FREQ,
+				     JOYCON_MAX_RUMBLE_HIGH_FREQ);
+	ctlr->rumble_rl_freq = clamp(ctlr->rumble_rl_freq,
+				     JOYCON_MIN_RUMBLE_LOW_FREQ,
+				     JOYCON_MAX_RUMBLE_LOW_FREQ);
+	ctlr->rumble_rh_freq = clamp(ctlr->rumble_rh_freq,
+				     JOYCON_MIN_RUMBLE_HIGH_FREQ,
+				     JOYCON_MAX_RUMBLE_HIGH_FREQ);
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 }
 
-static int nx_con_set_rumble(struct nx_con *con,
-			     u16 amp_r,
-			     u16 amp_l,
+static int joycon_set_rumble(struct joycon_ctlr *ctlr, u16 amp_r, u16 amp_l,
 			     bool schedule_now)
 {
-	u8 data[NX_CON_RUMBLE_DATA_SIZE];
+	u8 data[JC_RUMBLE_DATA_SIZE];
 	u16 amp;
 	u16 freq_r_low;
 	u16 freq_r_high;
 	u16 freq_l_low;
 	u16 freq_l_high;
 	unsigned long flags;
+	int next_rq_head;
 
-	spin_lock_irqsave(&con->lock, flags);
-	freq_r_low = con->rumble_rl_freq;
-	freq_r_high = con->rumble_rh_freq;
-	freq_l_low = con->rumble_ll_freq;
-	freq_l_high = con->rumble_lh_freq;
+	spin_lock_irqsave(&ctlr->lock, flags);
+	freq_r_low = ctlr->rumble_rl_freq;
+	freq_r_high = ctlr->rumble_rh_freq;
+	freq_l_low = ctlr->rumble_ll_freq;
+	freq_l_high = ctlr->rumble_lh_freq;
 	/* limit number of silent rumble packets to reduce traffic */
 	if (amp_l != 0 || amp_r != 0)
-		con->rumble_zero_countdown = NX_CON_RUMBLE_ZERO_AMP_PKT_CNT;
-	spin_unlock_irqrestore(&con->lock, flags);
+		ctlr->rumble_zero_countdown = JC_RUMBLE_ZERO_AMP_PKT_CNT;
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 
 	/* right joy-con */
-	amp = amp_r * (u32)nx_con_max_rumble_amp / 65535;
-	nx_con_encode_rumble(data + 4, freq_r_low, freq_r_high, amp);
+	amp = amp_r * (u32)joycon_max_rumble_amp / 65535;
+	joycon_encode_rumble(data + 4, freq_r_low, freq_r_high, amp);
 
 	/* left joy-con */
-	amp = amp_l * (u32)nx_con_max_rumble_amp / 65535;
-	nx_con_encode_rumble(data, freq_l_low, freq_l_high, amp);
+	amp = amp_l * (u32)joycon_max_rumble_amp / 65535;
+	joycon_encode_rumble(data, freq_l_low, freq_l_high, amp);
 
-	spin_lock_irqsave(&con->lock, flags);
-	if (++con->rumble_queue_head >= NX_CON_RUMBLE_QUEUE_SIZE)
-		con->rumble_queue_head = 0;
-	memcpy(con->rumble_data[con->rumble_queue_head], data, NX_CON_RUMBLE_DATA_SIZE);
-	spin_unlock_irqrestore(&con->lock, flags);
+	spin_lock_irqsave(&ctlr->lock, flags);
+
+	next_rq_head = ctlr->rumble_queue_head + 1;
+	if (next_rq_head >= JC_RUMBLE_QUEUE_SIZE)
+		next_rq_head = 0;
+
+	/* Did we overrun the circular buffer?
+	 * If so, be sure we keep the latest intended rumble state.
+	 */
+	if (next_rq_head == ctlr->rumble_queue_tail) {
+		hid_dbg(ctlr->hdev, "rumble queue is full");
+		/* overwrite the prior value at the end of the circular buf */
+		next_rq_head = ctlr->rumble_queue_head;
+	}
+
+	ctlr->rumble_queue_head = next_rq_head;
+	memcpy(ctlr->rumble_data[ctlr->rumble_queue_head], data,
+	       JC_RUMBLE_DATA_SIZE);
 
 	/* don't wait for the periodic send (reduces latency) */
-	if (schedule_now)
-		queue_work(con->rumble_queue, &con->rumble_worker);
+	if (schedule_now && ctlr->ctlr_state != JOYCON_CTLR_STATE_REMOVED)
+		queue_work(ctlr->rumble_queue, &ctlr->rumble_worker);
+
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 
 	return 0;
 }
 
-static int nx_con_play_effect(struct input_dev *idev,
-                              void *data,
-			      struct ff_effect *effect)
+static int joycon_play_effect(struct input_dev *dev, void *data,
+						     struct ff_effect *effect)
 {
-	struct nx_con *con = input_get_drvdata(idev);
+	struct joycon_ctlr *ctlr = input_get_drvdata(dev);
 
 	if (effect->type != FF_RUMBLE)
 		return 0;
 
-	return nx_con_set_rumble(con,
+	return joycon_set_rumble(ctlr,
 				 effect->u.rumble.weak_magnitude,
 				 effect->u.rumble.strong_magnitude,
 				 true);
 }
 #endif /* IS_ENABLED(CONFIG_NINTENDO_FF) */
 
-static void nx_con_config_left_stick(struct input_dev *idev)
+static void joycon_config_left_stick(struct input_dev *idev)
 {
 	input_set_abs_params(idev,
 			     ABS_X,
-			     -NX_CON_MAX_STICK_MAG,
-			     NX_CON_MAX_STICK_MAG,
-			     NX_CON_STICK_FUZZ,
-			     NX_CON_STICK_FLAT);
+			     -JC_MAX_STICK_MAG,
+			     JC_MAX_STICK_MAG,
+			     JC_STICK_FUZZ,
+			     JC_STICK_FLAT);
 	input_set_abs_params(idev,
 			     ABS_Y,
-			     -NX_CON_MAX_STICK_MAG,
-			     NX_CON_MAX_STICK_MAG,
-			     NX_CON_STICK_FUZZ,
-			     NX_CON_STICK_FLAT);
+			     -JC_MAX_STICK_MAG,
+			     JC_MAX_STICK_MAG,
+			     JC_STICK_FUZZ,
+			     JC_STICK_FLAT);
 }
 
-static void nx_con_config_right_stick(struct input_dev *idev)
+static void joycon_config_right_stick(struct input_dev *idev)
 {
 	input_set_abs_params(idev,
 			     ABS_RX,
-			     -NX_CON_MAX_STICK_MAG,
-			     NX_CON_MAX_STICK_MAG,
-			     NX_CON_STICK_FUZZ,
-			     NX_CON_STICK_FLAT);
+			     -JC_MAX_STICK_MAG,
+			     JC_MAX_STICK_MAG,
+			     JC_STICK_FUZZ,
+			     JC_STICK_FLAT);
 	input_set_abs_params(idev,
 			     ABS_RY,
-			     -NX_CON_MAX_STICK_MAG,
-			     NX_CON_MAX_STICK_MAG,
-			     NX_CON_STICK_FUZZ,
-			     NX_CON_STICK_FLAT);
+			     -JC_MAX_STICK_MAG,
+			     JC_MAX_STICK_MAG,
+			     JC_STICK_FUZZ,
+			     JC_STICK_FLAT);
 }
 
-static void nx_con_config_dpad(struct input_dev *idev)
+static void joycon_config_dpad(struct input_dev *idev)
 {
 	input_set_abs_params(idev,
 			     ABS_HAT0X,
-			     -NX_CON_MAX_DPAD_MAG,
-			     NX_CON_MAX_DPAD_MAG,
-			     NX_CON_DPAD_FUZZ,
-			     NX_CON_DPAD_FLAT);
+			     -JC_MAX_DPAD_MAG,
+			     JC_MAX_DPAD_MAG,
+			     JC_DPAD_FUZZ,
+			     JC_DPAD_FLAT);
 	input_set_abs_params(idev,
 			     ABS_HAT0Y,
-			     -NX_CON_MAX_DPAD_MAG,
-			     NX_CON_MAX_DPAD_MAG,
-			     NX_CON_DPAD_FUZZ,
-			     NX_CON_DPAD_FLAT);
+			     -JC_MAX_DPAD_MAG,
+			     JC_MAX_DPAD_MAG,
+			     JC_DPAD_FUZZ,
+			     JC_DPAD_FLAT);
 }
 
-static void nx_con_config_buttons(struct input_dev *idev,
-                                  const struct nx_con_button_mapping button_mappings[])
+static void joycon_config_buttons(struct input_dev *idev,
+		 const struct joycon_ctlr_button_mapping button_mappings[])
 {
-	const struct nx_con_button_mapping *button;
+	const struct joycon_ctlr_button_mapping *button;
 
 	for (button = button_mappings; button->code; button++)
 		input_set_capability(idev, EV_KEY, button->code);
 }
 
-static void nx_con_config_rumble(struct nx_con *con)
+static void joycon_config_rumble(struct joycon_ctlr *ctlr)
 {
 #if IS_ENABLED(CONFIG_NINTENDO_FF)
-	input_set_capability(con->idev, EV_FF, FF_RUMBLE);
-	input_ff_create_memless(con->idev, NULL, nx_con_play_effect);
-
-	con->rumble_ll_freq = NX_CON_RUMBLE_DFLT_LOW_FREQ;
-	con->rumble_lh_freq = NX_CON_RUMBLE_DFLT_HIGH_FREQ;
-	con->rumble_rl_freq = NX_CON_RUMBLE_DFLT_LOW_FREQ;
-	con->rumble_rh_freq = NX_CON_RUMBLE_DFLT_HIGH_FREQ;
-
-	nx_con_clamp_rumble_freqs(con);
-	nx_con_set_rumble(con, 0, 0, false);
-
-	con->rumble_msecs = jiffies_to_msecs(jiffies);
+	/* set up rumble */
+	input_set_capability(ctlr->input, EV_FF, FF_RUMBLE);
+	input_ff_create_memless(ctlr->input, NULL, joycon_play_effect);
+	ctlr->rumble_ll_freq = JC_RUMBLE_DFLT_LOW_FREQ;
+	ctlr->rumble_lh_freq = JC_RUMBLE_DFLT_HIGH_FREQ;
+	ctlr->rumble_rl_freq = JC_RUMBLE_DFLT_LOW_FREQ;
+	ctlr->rumble_rh_freq = JC_RUMBLE_DFLT_HIGH_FREQ;
+	joycon_clamp_rumble_freqs(ctlr);
+	joycon_set_rumble(ctlr, 0, 0, false);
+	ctlr->rumble_msecs = jiffies_to_msecs(jiffies);
 #endif
 }
 
-static int nx_con_imu_idev_create(struct nx_con *con)
+static int joycon_imu_input_create(struct joycon_ctlr *ctlr)
 {
 	struct hid_device *hdev;
 	const char *imu_name;
 	int ret;
 
-	hdev = con->hdev;
+	hdev = ctlr->hdev;
 
-	if (!(con->imu_idev = devm_input_allocate_device(&hdev->dev)))
+	/* configure the imu input device */
+	ctlr->imu_input = devm_input_allocate_device(&hdev->dev);
+	if (!ctlr->imu_input)
 		return -ENOMEM;
 
-	con->imu_idev->id.bustype = hdev->bus;
-	con->imu_idev->id.vendor = hdev->vendor;
-	con->imu_idev->id.product = hdev->product;
-	con->imu_idev->id.version = hdev->version;
-	con->imu_idev->uniq = con->mac_addr_str;
+	ctlr->imu_input->id.bustype = hdev->bus;
+	ctlr->imu_input->id.vendor = hdev->vendor;
+	ctlr->imu_input->id.product = hdev->product;
+	ctlr->imu_input->id.version = hdev->version;
+	ctlr->imu_input->uniq = ctlr->mac_addr_str;
+	ctlr->imu_input->phys = hdev->phys;
 
-	imu_name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "%s (IMU)", con->idev->name);
+	imu_name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "%s (IMU)", ctlr->input->name);
 	if (!imu_name)
 		return -ENOMEM;
 
-	con->imu_idev->name = imu_name;
+	ctlr->imu_input->name = imu_name;
 
-	input_set_drvdata(con->imu_idev, con);
+	input_set_drvdata(ctlr->imu_input, ctlr);
 
-	input_set_abs_params(con->imu_idev,
-			     ABS_X,
-			     -NX_CON_IMU_MAX_ACCEL_MAG,
-			     NX_CON_IMU_MAX_ACCEL_MAG,
-			     NX_CON_IMU_ACCEL_FUZZ,
-			     NX_CON_IMU_ACCEL_FLAT);
-	input_set_abs_params(con->imu_idev,
-			     ABS_Y,
-			     -NX_CON_IMU_MAX_ACCEL_MAG,
-			     NX_CON_IMU_MAX_ACCEL_MAG,
-			     NX_CON_IMU_ACCEL_FUZZ,
-			     NX_CON_IMU_ACCEL_FLAT);
-	input_set_abs_params(con->imu_idev,
-			     ABS_Z,
-			     -NX_CON_IMU_MAX_ACCEL_MAG,
-			     NX_CON_IMU_MAX_ACCEL_MAG,
-			     NX_CON_IMU_ACCEL_FUZZ,
-			     NX_CON_IMU_ACCEL_FLAT);
+	/* configure imu axes */
+	input_set_abs_params(ctlr->imu_input, ABS_X,
+			     -JC_IMU_MAX_ACCEL_MAG, JC_IMU_MAX_ACCEL_MAG,
+			     JC_IMU_ACCEL_FUZZ, JC_IMU_ACCEL_FLAT);
+	input_set_abs_params(ctlr->imu_input, ABS_Y,
+			     -JC_IMU_MAX_ACCEL_MAG, JC_IMU_MAX_ACCEL_MAG,
+			     JC_IMU_ACCEL_FUZZ, JC_IMU_ACCEL_FLAT);
+	input_set_abs_params(ctlr->imu_input, ABS_Z,
+			     -JC_IMU_MAX_ACCEL_MAG, JC_IMU_MAX_ACCEL_MAG,
+			     JC_IMU_ACCEL_FUZZ, JC_IMU_ACCEL_FLAT);
+	input_abs_set_res(ctlr->imu_input, ABS_X, JC_IMU_ACCEL_RES_PER_G);
+	input_abs_set_res(ctlr->imu_input, ABS_Y, JC_IMU_ACCEL_RES_PER_G);
+	input_abs_set_res(ctlr->imu_input, ABS_Z, JC_IMU_ACCEL_RES_PER_G);
 
-	input_abs_set_res(con->imu_idev, ABS_X, NX_CON_IMU_ACCEL_RES_PER_G);
-	input_abs_set_res(con->imu_idev, ABS_Y, NX_CON_IMU_ACCEL_RES_PER_G);
-	input_abs_set_res(con->imu_idev, ABS_Z, NX_CON_IMU_ACCEL_RES_PER_G);
+	input_set_abs_params(ctlr->imu_input, ABS_RX,
+			     -JC_IMU_MAX_GYRO_MAG, JC_IMU_MAX_GYRO_MAG,
+			     JC_IMU_GYRO_FUZZ, JC_IMU_GYRO_FLAT);
+	input_set_abs_params(ctlr->imu_input, ABS_RY,
+			     -JC_IMU_MAX_GYRO_MAG, JC_IMU_MAX_GYRO_MAG,
+			     JC_IMU_GYRO_FUZZ, JC_IMU_GYRO_FLAT);
+	input_set_abs_params(ctlr->imu_input, ABS_RZ,
+			     -JC_IMU_MAX_GYRO_MAG, JC_IMU_MAX_GYRO_MAG,
+			     JC_IMU_GYRO_FUZZ, JC_IMU_GYRO_FLAT);
 
-	input_set_abs_params(con->imu_idev,
-			     ABS_RX,
-			     -NX_CON_IMU_MAX_GYRO_MAG,
-			     NX_CON_IMU_MAX_GYRO_MAG,
-			     NX_CON_IMU_GYRO_FUZZ,
-			     NX_CON_IMU_GYRO_FLAT);
-	input_set_abs_params(con->imu_idev,
-			     ABS_RY,
-			     -NX_CON_IMU_MAX_GYRO_MAG,
-			     NX_CON_IMU_MAX_GYRO_MAG,
-			     NX_CON_IMU_GYRO_FUZZ,
-			     NX_CON_IMU_GYRO_FLAT);
-	input_set_abs_params(con->imu_idev,
-			     ABS_RZ,
-			     -NX_CON_IMU_MAX_GYRO_MAG,
-			     NX_CON_IMU_MAX_GYRO_MAG,
-			     NX_CON_IMU_GYRO_FUZZ,
-			     NX_CON_IMU_GYRO_FLAT);
+	input_abs_set_res(ctlr->imu_input, ABS_RX, JC_IMU_GYRO_RES_PER_DPS);
+	input_abs_set_res(ctlr->imu_input, ABS_RY, JC_IMU_GYRO_RES_PER_DPS);
+	input_abs_set_res(ctlr->imu_input, ABS_RZ, JC_IMU_GYRO_RES_PER_DPS);
 
-	input_abs_set_res(con->imu_idev, ABS_RX, NX_CON_IMU_GYRO_RES_PER_DPS);
-	input_abs_set_res(con->imu_idev, ABS_RY, NX_CON_IMU_GYRO_RES_PER_DPS);
-	input_abs_set_res(con->imu_idev, ABS_RZ, NX_CON_IMU_GYRO_RES_PER_DPS);
+	__set_bit(EV_MSC, ctlr->imu_input->evbit);
+	__set_bit(MSC_TIMESTAMP, ctlr->imu_input->mscbit);
+	__set_bit(INPUT_PROP_ACCELEROMETER, ctlr->imu_input->propbit);
 
-	__set_bit(EV_MSC, con->imu_idev->evbit);
-	__set_bit(MSC_TIMESTAMP, con->imu_idev->mscbit);
-	__set_bit(INPUT_PROP_ACCELEROMETER, con->imu_idev->propbit);
-
-	if ((ret = input_register_device(con->imu_idev)))
+	ret = input_register_device(ctlr->imu_input);
+	if (ret)
 		return ret;
 
 	return 0;
 }
 
-static int nx_con_idev_create(struct nx_con *con)
+static int joycon_input_create(struct joycon_ctlr *ctlr)
 {
 	struct hid_device *hdev;
 	int ret;
 
-	hdev = con->hdev;
+	hdev = ctlr->hdev;
 
-	if (!(con->idev = devm_input_allocate_device(&hdev->dev)))
+	ctlr->input = devm_input_allocate_device(&hdev->dev);
+	if (!ctlr->input)
 		return -ENOMEM;
+	ctlr->input->id.bustype = hdev->bus;
+	ctlr->input->id.vendor = hdev->vendor;
+	ctlr->input->id.product = hdev->product;
+	ctlr->input->id.version = hdev->version;
+	ctlr->input->uniq = ctlr->mac_addr_str;
+	ctlr->input->name = hdev->name;
+	ctlr->input->phys = hdev->phys;
+	input_set_drvdata(ctlr->input, ctlr);
 
-	con->idev->id.bustype = hdev->bus;
-	con->idev->id.vendor = hdev->vendor;
-	con->idev->id.product = hdev->product;
-	con->idev->id.version = hdev->version;
-	con->idev->name = hdev->name;
-	con->idev->uniq = con->mac_addr_str;
+	ret = input_register_device(ctlr->input);
+	if (ret)
+		return ret;
 
-	input_set_drvdata(con->idev, con);
-
-	if (nx_con_type_is_right_joycon(con)) {
-		nx_con_config_right_stick(con->idev);
-		nx_con_config_buttons(con->idev, right_joycon_button_mappings);
-		if (!nx_con_device_is_chrggrip(con))
-			nx_con_config_buttons(con->idev, right_joycon_s_button_mappings);
-	} else if (nx_con_type_is_left_joycon(con)) {
-		nx_con_config_left_stick(con->idev);
-		nx_con_config_buttons(con->idev, left_joycon_button_mappings);
-		if (!nx_con_device_is_chrggrip(con))
-			nx_con_config_buttons(con->idev, left_joycon_s_button_mappings);
-	} else if (nx_con_type_is_procon(con)) {
-		nx_con_config_left_stick(con->idev);
-		nx_con_config_right_stick(con->idev);
-		nx_con_config_dpad(con->idev);
-		nx_con_config_buttons(con->idev, procon_button_mappings);
-	} else if (nx_con_type_is_any_nescon(con)) {
-		nx_con_config_dpad(con->idev);
-		nx_con_config_buttons(con->idev, nescon_button_mappings);
-	} else if (nx_con_type_is_snescon(con)) {
-		nx_con_config_dpad(con->idev);
-		nx_con_config_buttons(con->idev, snescon_button_mappings);
-	} else if (nx_con_type_is_gencon(con)) {
-		nx_con_config_dpad(con->idev);
-		nx_con_config_buttons(con->idev, gencon_button_mappings);
-	} else if (nx_con_type_is_n64con(con)) {
-		nx_con_config_dpad(con->idev);
-		nx_con_config_left_stick(con->idev);
-		nx_con_config_buttons(con->idev, n64con_button_mappings);
+	if (joycon_type_is_right_joycon(ctlr)) {
+		joycon_config_right_stick(ctlr->input);
+		joycon_config_buttons(ctlr->input, right_joycon_button_mappings);
+		if (!joycon_device_is_chrggrip(ctlr))
+			joycon_config_buttons(ctlr->input, right_joycon_s_button_mappings);
+	} else if (joycon_type_is_left_joycon(ctlr)) {
+		joycon_config_left_stick(ctlr->input);
+		joycon_config_buttons(ctlr->input, left_joycon_button_mappings);
+		if (!joycon_device_is_chrggrip(ctlr))
+			joycon_config_buttons(ctlr->input, left_joycon_s_button_mappings);
+	} else if (joycon_type_is_procon(ctlr)) {
+		joycon_config_left_stick(ctlr->input);
+		joycon_config_right_stick(ctlr->input);
+		joycon_config_dpad(ctlr->input);
+		joycon_config_buttons(ctlr->input, procon_button_mappings);
+	} else if (joycon_type_is_any_nescon(ctlr)) {
+		joycon_config_dpad(ctlr->input);
+		joycon_config_buttons(ctlr->input, nescon_button_mappings);
+	} else if (joycon_type_is_snescon(ctlr)) {
+		joycon_config_dpad(ctlr->input);
+		joycon_config_buttons(ctlr->input, snescon_button_mappings);
+	} else if (joycon_type_is_gencon(ctlr)) {
+		joycon_config_dpad(ctlr->input);
+		joycon_config_buttons(ctlr->input, gencon_button_mappings);
+	} else if (joycon_type_is_n64con(ctlr)) {
+		joycon_config_dpad(ctlr->input);
+		joycon_config_left_stick(ctlr->input);
+		joycon_config_buttons(ctlr->input, n64con_button_mappings);
 	}
 
-	if (nx_con_has_imu(con) && (ret = nx_con_imu_idev_create(con)))
-		return ret;
+	if (joycon_has_imu(ctlr)) {
+		ret = joycon_imu_input_create(ctlr);
+		if (ret)
+			return ret;
+	}
 
-	if (nx_con_has_rumble(con))
-		nx_con_config_rumble(con);
-
-	if ((ret = input_register_device(con->idev)))
-		return ret;
+	if (joycon_has_rumble(ctlr))
+		joycon_config_rumble(ctlr);
 
 	return 0;
 }
 
-static int nx_con_player_led_brightness_set(struct led_classdev *led,
+/* Because the subcommand sets all the leds at once, the brightness argument is ignored */
+static int joycon_player_led_brightness_set(struct led_classdev *led,
 					    enum led_brightness brightness)
 {
 	struct device *dev = led->dev->parent;
 	struct hid_device *hdev = to_hid_device(dev);
-	struct nx_con *con;
+	struct joycon_ctlr *ctlr;
 	int val = 0;
 	int i;
 	int ret;
-	int num;
 
-	if (!(con = hid_get_drvdata(hdev))) {
+	ctlr = hid_get_drvdata(hdev);
+	if (!ctlr) {
 		hid_err(hdev, "No controller data\n");
 		return -ENODEV;
 	}
 
-	/* determine which player led this is */
-	for (num = 0; num < NX_CON_NUM_LEDS; num++) {
-		if (&con->leds[num] == led)
-			break;
-	}
-	if (num >= NX_CON_NUM_LEDS)
-		return -EINVAL;
+	for (i = 0; i < JC_NUM_LEDS; i++)
+		val |= ctlr->leds[i].brightness << i;
 
-	mutex_lock(&con->output_mutex);
-	for (i = 0; i < NX_CON_NUM_LEDS; i++) {
-		if (i == num)
-			val |= brightness << i;
-		else
-			val |= con->leds[i].brightness << i;
-	}
-	ret = nx_con_set_player_leds(con, 0, val);
-	mutex_unlock(&con->output_mutex);
+	mutex_lock(&ctlr->output_mutex);
+	ret = joycon_set_player_leds(ctlr, 0, val);
+	mutex_unlock(&ctlr->output_mutex);
 
 	return ret;
 }
 
-static int nx_con_home_led_brightness_set(struct led_classdev *led,
+static int joycon_home_led_brightness_set(struct led_classdev *led,
 					  enum led_brightness brightness)
 {
 	struct device *dev = led->dev->parent;
 	struct hid_device *hdev = to_hid_device(dev);
-	struct nx_con *con;
-	struct nx_con_subcmd_request *req;
-	u8 buffer[sizeof(*req) + 5] = { 0 };
-	u8 *data;
+	struct joycon_ctlr *ctlr;
 	int ret;
 
-	if (!(con = hid_get_drvdata(hdev))) {
+	ctlr = hid_get_drvdata(hdev);
+	if (!ctlr) {
 		hid_err(hdev, "No controller data\n");
 		return -ENODEV;
 	}
-
-	req = (struct nx_con_subcmd_request *)buffer;
-	req->subcmd_id = NX_CON_SUBCMD_SET_HOME_LIGHT;
-	data = req->data;
-	data[0] = 0x01;
-	data[1] = brightness << 4;
-	data[2] = brightness | (brightness << 4);
-	data[3] = 0x11;
-	data[4] = 0x11;
-
-	hid_dbg(hdev, "setting home led brightness\n");
-	mutex_lock(&con->output_mutex);
-	ret = nx_con_send_subcmd(con, req, 5, HZ/4);
-	mutex_unlock(&con->output_mutex);
-
+	mutex_lock(&ctlr->output_mutex);
+	ret = joycon_set_home_led(ctlr, brightness);
+	mutex_unlock(&ctlr->output_mutex);
 	return ret;
 }
 
-static DEFINE_MUTEX(nx_con_input_num_mutex);
-static int nx_con_leds_create(struct nx_con *con)
+static DEFINE_IDA(nintendo_player_id_allocator);
+
+static int joycon_leds_create(struct joycon_ctlr *ctlr)
 {
-	struct hid_device *hdev = con->hdev;
+	struct hid_device *hdev = ctlr->hdev;
 	struct device *dev = &hdev->dev;
 	const char *d_name = dev_name(dev);
 	struct led_classdev *led;
+	int led_val = 0;
 	char *name;
-	int ret = 0;
+	int ret;
 	int i;
-	static int input_num = 1;
-
-	/* Set the default controller player leds based on controller number */
-	mutex_lock(&nx_con_input_num_mutex);
-	mutex_lock(&con->output_mutex);
-	if ((ret = nx_con_set_player_leds(con, 0, 0xF >> (4 - input_num))))
-		hid_warn(con->hdev, "Failed to set leds; ret=%d\n", ret);
-	mutex_unlock(&con->output_mutex);
+	int player_led_pattern;
 
 	/* configure the player LEDs */
-	for (i = 0; i < NX_CON_NUM_LEDS; i++) {
-		name = devm_kasprintf(dev,
-				      GFP_KERNEL,
-				      "%s:%s:%s",
+	ctlr->player_id = U32_MAX;
+	ret = ida_alloc(&nintendo_player_id_allocator, GFP_KERNEL);
+	if (ret < 0) {
+		hid_warn(hdev, "Failed to allocate player ID, skipping; ret=%d\n", ret);
+		goto home_led;
+	}
+	ctlr->player_id = ret;
+	player_led_pattern = ret % JC_NUM_LED_PATTERNS;
+	hid_info(ctlr->hdev, "assigned player %d led pattern", player_led_pattern + 1);
+
+	for (i = 0; i < JC_NUM_LEDS; i++) {
+		name = devm_kasprintf(dev, GFP_KERNEL, "%s:%s:%s",
 				      d_name,
 				      "green",
-				      nx_con_player_led_names[i]);
-		if (!name) {
-			mutex_unlock(&nx_con_input_num_mutex);
+				      joycon_player_led_names[i]);
+		if (!name)
 			return -ENOMEM;
-		}
 
-		led = &con->leds[i];
+		led = &ctlr->leds[i];
 		led->name = name;
-		led->brightness = ((i + 1) <= input_num) ? 1 : 0;
+		led->brightness = joycon_player_led_patterns[player_led_pattern][i];
 		led->max_brightness = 1;
-		led->brightness_set_blocking = nx_con_player_led_brightness_set;
+		led->brightness_set_blocking =
+					joycon_player_led_brightness_set;
 		led->flags = LED_CORE_SUSPENDRESUME | LED_HW_PLUGGABLE;
 
-		if ((ret = devm_led_classdev_register(&hdev->dev, led))) {
-			hid_err(hdev, "Failed registering %s LED\n", led->name);
-			mutex_unlock(&nx_con_input_num_mutex);
+		led_val |= joycon_player_led_patterns[player_led_pattern][i] << i;
+	}
+	mutex_lock(&ctlr->output_mutex);
+	ret = joycon_set_player_leds(ctlr, 0, led_val);
+	mutex_unlock(&ctlr->output_mutex);
+	if (ret) {
+		hid_warn(hdev, "Failed to set players LEDs, skipping registration; ret=%d\n", ret);
+		goto home_led;
+	}
+
+	for (i = 0; i < JC_NUM_LEDS; i++) {
+		led = &ctlr->leds[i];
+		ret = devm_led_classdev_register(&hdev->dev, led);
+		if (ret) {
+			hid_err(hdev, "Failed to register player %d LED; ret=%d\n", i + 1, ret);
 			return ret;
 		}
 	}
 
-	if (++input_num > 4)
-		input_num = 1;
-	mutex_unlock(&nx_con_input_num_mutex);
-
+home_led:
 	/* configure the home LED */
-	if (nx_con_type_has_right_controls(con)) {
-		name = devm_kasprintf(dev,
-				      GFP_KERNEL,
-				      "%s:%s:%s",
+	if (jc_type_has_right(ctlr)) {
+		name = devm_kasprintf(dev, GFP_KERNEL, "%s:%s:%s",
 				      d_name,
 				      "blue",
-				      LED_FUNCTION_PLAYER5);
+				      "player-5");
 		if (!name)
 			return -ENOMEM;
 
-		led = &con->home_led;
+		led = &ctlr->home_led;
 		led->name = name;
 		led->brightness = 0;
 		led->max_brightness = 0xF;
-		led->brightness_set_blocking = nx_con_home_led_brightness_set;
+		led->brightness_set_blocking = joycon_home_led_brightness_set;
 		led->flags = LED_CORE_SUSPENDRESUME | LED_HW_PLUGGABLE;
 
-		if ((ret = devm_led_classdev_register(&hdev->dev, led))) {
-			hid_err(hdev, "Failed registering home led\n");
-			return ret;
+		/* Set the home LED to 0 as default state */
+		mutex_lock(&ctlr->output_mutex);
+		ret = joycon_set_home_led(ctlr, 0);
+		mutex_unlock(&ctlr->output_mutex);
+		if (ret) {
+			hid_warn(hdev, "Failed to set home LED, skipping registration; ret=%d\n", ret);
+			return 0;
 		}
 
-		/* Set the home LED to 0 as default state */
-		if ((ret = nx_con_home_led_brightness_set(led, 0))) {
-			hid_warn(hdev, "Failed to set home LED default, unregistering home LED");
-			devm_led_classdev_unregister(&hdev->dev, led);
+		ret = devm_led_classdev_register(&hdev->dev, led);
+		if (ret) {
+			hid_err(hdev, "Failed to register home LED; ret=%d\n", ret);
+			return ret;
 		}
 	}
 
 	return 0;
 }
 
-static int nx_con_battery_get_property(struct power_supply *supply,
+static int joycon_battery_get_property(struct power_supply *supply,
 				       enum power_supply_property prop,
 				       union power_supply_propval *val)
 {
-	struct nx_con *con = power_supply_get_drvdata(supply);
+	struct joycon_ctlr *ctlr = power_supply_get_drvdata(supply);
 	unsigned long flags;
 	int ret = 0;
 	u8 capacity;
 	bool charging;
 	bool powered;
 
-	spin_lock_irqsave(&con->lock, flags);
-	capacity = con->battery_capacity;
-	charging = con->battery_charging;
-	powered = con->host_powered;
-	spin_unlock_irqrestore(&con->lock, flags);
+	spin_lock_irqsave(&ctlr->lock, flags);
+	capacity = ctlr->battery_capacity;
+	charging = ctlr->battery_charging;
+	powered = ctlr->host_powered;
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 
 	switch (prop) {
 	case POWER_SUPPLY_PROP_PRESENT:
@@ -2285,122 +2402,224 @@ static int nx_con_battery_get_property(struct power_supply *supply,
 	return ret;
 }
 
-static enum power_supply_property nx_con_battery_props[] = {
+static enum power_supply_property joycon_battery_props[] = {
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 	POWER_SUPPLY_PROP_SCOPE,
 	POWER_SUPPLY_PROP_STATUS,
 };
 
-static int nx_con_power_supply_create(struct nx_con *con)
+static int joycon_power_supply_create(struct joycon_ctlr *ctlr)
 {
-	struct hid_device *hdev = con->hdev;
-	struct power_supply_config supply_config = { .drv_data = con, };
+	struct hid_device *hdev = ctlr->hdev;
+	struct power_supply_config supply_config = { .drv_data = ctlr, };
 	const char * const name_fmt = "nintendo_switch_controller_battery_%s";
 	int ret = 0;
 
 	/* Set initially to unknown before receiving first input report */
-	con->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
+	ctlr->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
 
 	/* Configure the battery's description */
-	con->battery_desc.properties = nx_con_battery_props;
-	con->battery_desc.num_properties = ARRAY_SIZE(nx_con_battery_props);
-	con->battery_desc.get_property = nx_con_battery_get_property;
-	con->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
-	con->battery_desc.use_for_apm = 0;
-	con->battery_desc.name = devm_kasprintf(&hdev->dev, GFP_KERNEL,
+	ctlr->battery_desc.properties = joycon_battery_props;
+	ctlr->battery_desc.num_properties =
+					ARRAY_SIZE(joycon_battery_props);
+	ctlr->battery_desc.get_property = joycon_battery_get_property;
+	ctlr->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
+	ctlr->battery_desc.use_for_apm = 0;
+	ctlr->battery_desc.name = devm_kasprintf(&hdev->dev, GFP_KERNEL,
 						 name_fmt,
 						 dev_name(&hdev->dev));
-	if (!con->battery_desc.name)
+	if (!ctlr->battery_desc.name)
 		return -ENOMEM;
 
-	con->battery = devm_power_supply_register(&hdev->dev,
-						  &con->battery_desc,
-						  &supply_config);
-	if (IS_ERR(con->battery)) {
-		ret = PTR_ERR(con->battery);
+	ctlr->battery = devm_power_supply_register(&hdev->dev,
+						   &ctlr->battery_desc,
+						   &supply_config);
+	if (IS_ERR(ctlr->battery)) {
+		ret = PTR_ERR(ctlr->battery);
 		hid_err(hdev, "Failed to register battery; ret=%d\n", ret);
 		return ret;
 	}
 
-	return power_supply_powers(con->battery, &hdev->dev);
+	return power_supply_powers(ctlr->battery, &hdev->dev);
 }
 
-static int nx_con_request_device_info(struct nx_con *con)
+static int joycon_read_info(struct joycon_ctlr *ctlr)
 {
 	int ret;
 	int i;
 	int j;
-	struct nx_con_subcmd_request req = { 0 };
-	struct nx_con_input_report *report;
+	struct joycon_subcmd_request req = { 0 };
+	struct joycon_input_report *report;
 
-	req.subcmd_id = NX_CON_SUBCMD_REQ_DEV_INFO;
-	if ((ret = nx_con_send_subcmd(con, &req, 0, HZ))) {
-		hid_err(con->hdev, "Failed to get NX controller info; ret=%d\n", ret);
+	req.subcmd_id = JC_SUBCMD_REQ_DEV_INFO;
+	ret = joycon_send_subcmd(ctlr, &req, 0, HZ);
+	if (ret) {
+		hid_err(ctlr->hdev, "Failed to get joycon info; ret=%d\n", ret);
 		return ret;
 	}
 
-	report = (struct nx_con_input_report *)con->input_buf;
+	report = (struct joycon_input_report *)ctlr->input_buf;
 
 	for (i = 4, j = 0; j < 6; i++, j++)
-		con->mac_addr[j] = report->subcmd_reply.data[i];
+		ctlr->mac_addr[j] = report->subcmd_reply.data[i];
 
-	con->mac_addr_str = devm_kasprintf(&con->hdev->dev,
-					   GFP_KERNEL,
-					   "%02X:%02X:%02X:%02X:%02X:%02X",
-					   con->mac_addr[0],
-					   con->mac_addr[1],
-					   con->mac_addr[2],
-					   con->mac_addr[3],
-					   con->mac_addr[4],
-					   con->mac_addr[5]);
-	if (!con->mac_addr_str)
+	ctlr->mac_addr_str = devm_kasprintf(&ctlr->hdev->dev, GFP_KERNEL,
+					    "%02X:%02X:%02X:%02X:%02X:%02X",
+					    ctlr->mac_addr[0],
+					    ctlr->mac_addr[1],
+					    ctlr->mac_addr[2],
+					    ctlr->mac_addr[3],
+					    ctlr->mac_addr[4],
+					    ctlr->mac_addr[5]);
+	if (!ctlr->mac_addr_str)
 		return -ENOMEM;
-	hid_info(con->hdev, "controller MAC = %s\n", con->mac_addr_str);
+	hid_info(ctlr->hdev, "controller MAC = %s\n", ctlr->mac_addr_str);
 
-	/* Retrieve the type so we can distinguish for charging grip */
-	con->type = report->subcmd_reply.data[2];
-
-	hid_dbg(con->hdev, "con->type = 0x%02X\n", con->type);
+	/*
+	 * Retrieve the type so we can distinguish the controller type
+	 * Unfortantly the hdev->product can't always be used due to a ?bug?
+	 * with the NSO Genesis controller. Over USB, it will report the
+	 * PID as 0x201E, but over bluetooth it will report the PID as 0x2017
+	 * which is the same as the NSO SNES controller. This is different from
+	 * the rest of the controllers which will report the same PID over USB
+	 * and bluetooth.
+	 */
+	ctlr->ctlr_type = report->subcmd_reply.data[2];
+	hid_dbg(ctlr->hdev, "controller type = 0x%02X\n", ctlr->ctlr_type);
 
 	return 0;
 }
 
-/* Common handler for parsing inputs */
-static int nx_con_read_handler(struct nx_con *con, u8 *data, int size)
+static int joycon_init(struct hid_device *hdev)
 {
-	if ((data[0] == NX_CON_INPUT_SUBCMD_REPLY ||
-	     data[0] == NX_CON_INPUT_IMU_DATA ||
-	     data[0] == NX_CON_INPUT_MCU_DATA) &&
-	     size >= 12) { /* make sure it contains the input report */
-		nx_con_parse_report(con, (struct nx_con_input_report *)data);
+	struct joycon_ctlr *ctlr = hid_get_drvdata(hdev);
+	int ret = 0;
+
+	mutex_lock(&ctlr->output_mutex);
+	/* if handshake command fails, assume ble pro controller */
+	if (joycon_using_usb(ctlr) && !joycon_send_usb(ctlr, JC_USB_CMD_HANDSHAKE, HZ)) {
+		hid_dbg(hdev, "detected USB controller\n");
+		/* set baudrate for improved latency */
+		ret = joycon_send_usb(ctlr, JC_USB_CMD_BAUDRATE_3M, HZ);
+		if (ret) {
+			hid_err(hdev, "Failed to set baudrate; ret=%d\n", ret);
+			goto out_unlock;
+		}
+		/* handshake */
+		ret = joycon_send_usb(ctlr, JC_USB_CMD_HANDSHAKE, HZ);
+		if (ret) {
+			hid_err(hdev, "Failed handshake; ret=%d\n", ret);
+			goto out_unlock;
+		}
+		/*
+		 * Set no timeout (to keep controller in USB mode).
+		 * This doesn't send a response, so ignore the timeout.
+		 */
+		joycon_send_usb(ctlr, JC_USB_CMD_NO_TIMEOUT, HZ/10);
+	} else if (jc_type_is_chrggrip(ctlr)) {
+		hid_err(hdev, "Failed charging grip handshake\n");
+		ret = -ETIMEDOUT;
+		goto out_unlock;
+	}
+
+	/* needed to retrieve the controller type */
+	ret = joycon_read_info(ctlr);
+	if (ret) {
+		hid_err(hdev, "Failed to retrieve controller info; ret=%d\n",
+			ret);
+		goto out_unlock;
+	}
+
+	if (joycon_has_joysticks(ctlr)) {
+		/* get controller calibration data, and parse it */
+		ret = joycon_request_calibration(ctlr);
+		if (ret) {
+			/*
+			 * We can function with default calibration, but it may be
+			 * inaccurate. Provide a warning, and continue on.
+			 */
+			hid_warn(hdev, "Analog stick positions may be inaccurate\n");
+		}
+	}
+
+	if (joycon_has_imu(ctlr)) {
+		/* get IMU calibration data, and parse it */
+		ret = joycon_request_imu_calibration(ctlr);
+		if (ret) {
+			/*
+			 * We can function with default calibration, but it may be
+			 * inaccurate. Provide a warning, and continue on.
+			 */
+			hid_warn(hdev, "Unable to read IMU calibration data\n");
+		}
+
+		/* Enable the IMU */
+		ret = joycon_enable_imu(ctlr);
+		if (ret) {
+			hid_err(hdev, "Failed to enable the IMU; ret=%d\n", ret);
+			goto out_unlock;
+		}
+	}
+
+	/* Set the reporting mode to 0x30, which is the full report mode */
+	ret = joycon_set_report_mode(ctlr);
+	if (ret) {
+		hid_err(hdev, "Failed to set report mode; ret=%d\n", ret);
+		goto out_unlock;
+	}
+
+	if (joycon_has_rumble(ctlr)) {
+		/* Enable rumble */
+		ret = joycon_enable_rumble(ctlr);
+		if (ret) {
+			hid_err(hdev, "Failed to enable rumble; ret=%d\n", ret);
+			goto out_unlock;
+		}
+	}
+
+out_unlock:
+	mutex_unlock(&ctlr->output_mutex);
+	return ret;
+}
+
+/* Common handler for parsing inputs */
+static int joycon_ctlr_read_handler(struct joycon_ctlr *ctlr, u8 *data,
+							      int size)
+{
+	if (data[0] == JC_INPUT_SUBCMD_REPLY || data[0] == JC_INPUT_IMU_DATA ||
+	    data[0] == JC_INPUT_MCU_DATA) {
+		if (size >= 12) /* make sure it contains the input report */
+			joycon_parse_report(ctlr,
+					    (struct joycon_input_report *)data);
 	}
 
 	return 0;
 }
 
-static int nx_con_handle_event(struct nx_con *con, u8 *data, int size)
+static int joycon_ctlr_handle_event(struct joycon_ctlr *ctlr, u8 *data,
+							      int size)
 {
 	int ret = 0;
 	bool match = false;
-	struct nx_con_input_report *report;
+	struct joycon_input_report *report;
 
-	if (unlikely(mutex_is_locked(&con->output_mutex)) &&
-	    con->msg_type != NX_CON_MSG_TYPE_NONE) {
-		switch (con->msg_type) {
-		case NX_CON_MSG_TYPE_USB:
+	if (unlikely(mutex_is_locked(&ctlr->output_mutex)) &&
+	    ctlr->msg_type != JOYCON_MSG_TYPE_NONE) {
+		switch (ctlr->msg_type) {
+		case JOYCON_MSG_TYPE_USB:
 			if (size < 2)
 				break;
-			if (data[0] == NX_CON_INPUT_USB_RESPONSE &&
-			    data[1] == con->usb_ack_match)
+			if (data[0] == JC_INPUT_USB_RESPONSE &&
+			    data[1] == ctlr->usb_ack_match)
 				match = true;
 			break;
-		case NX_CON_MSG_TYPE_SUBCMD:
-			if (size < sizeof(struct nx_con_input_report) ||
-			    data[0] != NX_CON_INPUT_SUBCMD_REPLY)
+		case JOYCON_MSG_TYPE_SUBCMD:
+			if (size < sizeof(struct joycon_input_report) ||
+			    data[0] != JC_INPUT_SUBCMD_REPLY)
 				break;
-			report = (struct nx_con_input_report *)data;
-			if (report->subcmd_reply.id == con->subcmd_ack_match)
+			report = (struct joycon_input_report *)data;
+			if (report->subcmd_reply.id == ctlr->subcmd_ack_match)
 				match = true;
 			break;
 		default:
@@ -2408,137 +2627,66 @@ static int nx_con_handle_event(struct nx_con *con, u8 *data, int size)
 		}
 
 		if (match) {
-			memcpy(con->input_buf, data,
-			       min(size, (int)NX_CON_MAX_RESP_SIZE));
-			con->msg_type = NX_CON_MSG_TYPE_NONE;
-			con->received_resp = true;
-			wake_up(&con->wait);
+			memcpy(ctlr->input_buf, data,
+			       min(size, (int)JC_MAX_RESP_SIZE));
+			ctlr->msg_type = JOYCON_MSG_TYPE_NONE;
+			ctlr->received_resp = true;
+			wake_up(&ctlr->wait);
 
 			/* This message has been handled */
 			return 1;
 		}
 	}
 
-	if (con->state == NX_CON_STATE_READ)
-		ret = nx_con_read_handler(con, data, size);
+	if (ctlr->ctlr_state == JOYCON_CTLR_STATE_READ)
+		ret = joycon_ctlr_read_handler(ctlr, data, size);
 
 	return ret;
 }
 
-static int nx_hid_event(struct hid_device *hdev,
-			struct hid_report *report,
-			u8 *raw_data,
-			int size)
+static int nintendo_hid_event(struct hid_device *hdev,
+			      struct hid_report *report, u8 *raw_data, int size)
 {
-	struct nx_con *con = hid_get_drvdata(hdev);
+	struct joycon_ctlr *ctlr = hid_get_drvdata(hdev);
 
 	if (size < 1)
 		return -EINVAL;
 
-	return nx_con_handle_event(con, raw_data, size);
+	return joycon_ctlr_handle_event(ctlr, raw_data, size);
 }
 
-static int nx_con_init_rumble_worker(struct nx_con *con)
-{
-	if (!(con->rumble_queue = alloc_workqueue("hid-nx-rumble_wq",
-					          WQ_FREEZABLE | WQ_MEM_RECLAIM,
-					          0)))
-		return -ENOMEM;
-
-	INIT_WORK(&con->rumble_worker, nx_con_rumble_worker);
-
-	return 0;
-}
-
-static inline bool nx_con_using_usb(struct nx_con *con)
-{
-	return con->hdev->bus == BUS_USB;
-}
-
-static int nx_con_usb_handshake(struct nx_con *con)
+static int nintendo_hid_probe(struct hid_device *hdev,
+			    const struct hid_device_id *id)
 {
 	int ret;
-
-	hid_dbg(con->hdev, "setting USB baud rate\n");
-
-	if ((ret = nx_con_send_usb(con, NX_CON_USB_CMD_BAUDRATE_3M, HZ))) {
-		hid_err(con->hdev, "Failed to set baudrate; ret=%d\n", ret);
-		return ret;
-	}
-
-	hid_dbg(con->hdev, "sending USB handshake\n");
-	
-	if ((ret = nx_con_send_usb(con, NX_CON_USB_CMD_HANDSHAKE, HZ))) {
-		hid_err(con->hdev, "Failed handshake; ret=%d\n", ret);
-		return ret;
-	}
-
-	/*
-	 * Set no timeout (to keep controller in USB mode).
-	 * This doesn't send a response, so ignore the timeout.
-	 */
-	hid_dbg(con->hdev, "disabling USB timeout\n");
-	nx_con_send_usb(con, NX_CON_USB_CMD_NO_TIMEOUT, HZ/10);
-
-	return 0;
-}
-
-static void nx_con_probe_hid_dbg_device(struct nx_con *con)
-{
-	hid_dbg(con->hdev, "device_is_left_joycon    = %d\n", nx_con_device_is_left_joycon(con));
- 	hid_dbg(con->hdev, "device_is_right_joycon   = %d\n", nx_con_device_is_right_joycon(con));
- 	hid_dbg(con->hdev, "device_is_procon         = %d\n", nx_con_device_is_procon(con));
- 	hid_dbg(con->hdev, "device_is_chrggrip       = %d\n", nx_con_device_is_chrggrip(con));
- 	hid_dbg(con->hdev, "device_is_snescon        = %d\n", nx_con_device_is_snescon(con));
- 	hid_dbg(con->hdev, "device_is_gencon         = %d\n", nx_con_device_is_gencon(con));
- 	hid_dbg(con->hdev, "device_is_n64con         = %d\n", nx_con_device_is_n64con(con));
- 	hid_dbg(con->hdev, "device_has_usb           = %d\n", nx_con_device_has_usb(con));
- 	hid_dbg(con->hdev, "type_is_left_joycon      = %d\n", nx_con_type_is_left_joycon(con));
- 	hid_dbg(con->hdev, "type_is_right_joycon     = %d\n", nx_con_type_is_right_joycon(con));
- 	hid_dbg(con->hdev, "type_is_procon           = %d\n", nx_con_type_is_procon(con));
- 	hid_dbg(con->hdev, "type_is_snescon          = %d\n", nx_con_type_is_snescon(con));
- 	hid_dbg(con->hdev, "type_is_gencon           = %d\n", nx_con_type_is_gencon(con));
- 	hid_dbg(con->hdev, "type_is_n64con           = %d\n", nx_con_type_is_n64con(con));
- 	hid_dbg(con->hdev, "type_is_left_nescon      = %d\n", nx_con_type_is_left_nescon(con));
- 	hid_dbg(con->hdev, "type_is_right_nescon     = %d\n", nx_con_type_is_right_nescon(con));
- 	hid_dbg(con->hdev, "type_has_left_controls   = %d\n", nx_con_type_has_left_controls(con));
- 	hid_dbg(con->hdev, "type_has_right_controls  = %d\n", nx_con_type_has_right_controls(con));
- 	hid_dbg(con->hdev, "type_is_any_joycon       = %d\n", nx_con_type_is_any_joycon(con));
- 	hid_dbg(con->hdev, "type_is_any_nescon       = %d\n", nx_con_type_is_any_nescon(con));
- 	hid_dbg(con->hdev, "has_imu                  = %d\n", nx_con_has_imu(con));
- 	hid_dbg(con->hdev, "has_joysticks            = %d\n", nx_con_has_joysticks(con));
- 	hid_dbg(con->hdev, "has_rumble               = %d\n", nx_con_has_rumble(con));
-	hid_dbg(con->hdev, "using_usb                = %d\n", nx_con_using_usb(con));
-}
-
-static int nx_hid_probe(struct hid_device *hdev,
-			const struct hid_device_id *id)
-{
-	int ret;
-	struct nx_con *con;
+	struct joycon_ctlr *ctlr;
 
 	hid_dbg(hdev, "probe - start\n");
 
-	if (!(con = devm_kzalloc(&hdev->dev, sizeof(*con), GFP_KERNEL))) {
+	ctlr = devm_kzalloc(&hdev->dev, sizeof(*ctlr), GFP_KERNEL);
+	if (!ctlr) {
 		ret = -ENOMEM;
 		goto err;
 	}
 
-	con->hdev = hdev;
-	con->state = NX_CON_STATE_INIT;
-	con->rumble_queue_head = NX_CON_RUMBLE_QUEUE_SIZE - 1;
-	con->rumble_queue_tail = 0;
-	hid_set_drvdata(hdev, con);
-	mutex_init(&con->output_mutex);
-	init_waitqueue_head(&con->wait);
-	spin_lock_init(&con->lock);
-
-	if ((ret = nx_con_init_rumble_worker(con))) {
-		hid_err(hdev, "Failed to initialize rumble worker/queue\n");
-		goto err_wq;
+	ctlr->hdev = hdev;
+	ctlr->ctlr_state = JOYCON_CTLR_STATE_INIT;
+	ctlr->rumble_queue_head = 0;
+	ctlr->rumble_queue_tail = 0;
+	hid_set_drvdata(hdev, ctlr);
+	mutex_init(&ctlr->output_mutex);
+	init_waitqueue_head(&ctlr->wait);
+	spin_lock_init(&ctlr->lock);
+	ctlr->rumble_queue = alloc_workqueue("hid-nintendo-rumble_wq",
+					     WQ_FREEZABLE | WQ_MEM_RECLAIM, 0);
+	if (!ctlr->rumble_queue) {
+		ret = -ENOMEM;
+		goto err;
 	}
+	INIT_WORK(&ctlr->rumble_worker, joycon_rumble_worker);
 
-	if ((ret = hid_parse(hdev))) {
+	ret = hid_parse(hdev);
+	if (ret) {
 		hid_err(hdev, "HID parse failed\n");
 		goto err_wq;
 	}
@@ -2552,149 +2700,150 @@ static int nx_hid_probe(struct hid_device *hdev,
 	 */
 	hdev->version |= 0x8000;
 
-	if ((ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW))) {
+	ret = hid_hw_start(hdev, HID_CONNECT_HIDRAW);
+	if (ret) {
 		hid_err(hdev, "HW start failed\n");
 		goto err_wq;
 	}
 
-	if ((ret = hid_hw_open(hdev))) {
+	ret = hid_hw_open(hdev);
+	if (ret) {
 		hid_err(hdev, "cannot start hardware I/O\n");
 		goto err_stop;
 	}
 
 	hid_device_io_start(hdev);
 
-	mutex_lock(&con->output_mutex);
-
-	if (nx_con_using_usb(con) && (ret = nx_con_usb_handshake(con)))
-		goto err_mutex;
-
-	if ((ret = nx_con_set_report_mode(con))) {
-		hid_err(hdev, "Failed to set report mode; ret=%d\n", ret);
-		goto err_mutex;
+	ret = joycon_init(hdev);
+	if (ret) {
+		hid_err(hdev, "Failed to initialize controller; ret=%d\n", ret);
+		goto err_close;
 	}
 
-	/* needed for `con->type` */
-	if ((ret = nx_con_request_device_info(con))) {
-		hid_err(hdev, "Failed to retrieve controller info; ret=%d\n", ret);
-		goto err_mutex;
-	}
-
-	if (nx_con_has_joysticks(con)) {
-		if (nx_con_request_calibration(con)) {
-			/*
-			* We can function with default calibration, but it may be
-			* inaccurate. Provide a warning, and continue on.
-			*/
-			hid_warn(hdev, "Analog stick positions may be inaccurate\n");
-		}
-	}
-
-	if (nx_con_has_imu(con)) {
-		if (nx_con_request_imu_calibration(con)) {
-			/*
-			* We can function with default calibration, but it may be
-			* inaccurate. Provide a warning, and continue on.
-			*/
-			hid_warn(hdev, "Unable to read IMU calibration data\n");
-		}
-
-		if ((ret = nx_con_enable_imu(con))) {
-			hid_err(hdev, "Failed to enable the IMU; ret=%d\n", ret);
-			goto err_mutex;
-		}
-	}
-
-	if (nx_con_has_rumble(con)) {
-		if ((ret = nx_con_enable_rumble(con))) {
-			hid_err(hdev, "Failed to enable rumble; ret=%d\n", ret);
-			goto err_mutex;
-		}
-
-	}
-
-	mutex_unlock(&con->output_mutex);
-
-	if ((ret = nx_con_leds_create(con))) {
+	/* Initialize the leds */
+	ret = joycon_leds_create(ctlr);
+	if (ret) {
 		hid_err(hdev, "Failed to create leds; ret=%d\n", ret);
 		goto err_close;
 	}
 
-	if ((ret = nx_con_power_supply_create(con))) {
+	/* Initialize the battery power supply */
+	ret = joycon_power_supply_create(ctlr);
+	if (ret) {
 		hid_err(hdev, "Failed to create power_supply; ret=%d\n", ret);
 		goto err_close;
 	}
 
-	if ((ret = nx_con_idev_create(con))) {
+	ret = joycon_input_create(ctlr);
+	if (ret) {
 		hid_err(hdev, "Failed to create input device; ret=%d\n", ret);
 		goto err_close;
 	}
 
-	con->state = NX_CON_STATE_READ;
+	ctlr->ctlr_state = JOYCON_CTLR_STATE_READ;
 
-	nx_con_probe_hid_dbg_device(con);
 	hid_dbg(hdev, "probe - success\n");
-
 	return 0;
 
-err_mutex:
-	mutex_unlock(&con->output_mutex);
 err_close:
 	hid_hw_close(hdev);
 err_stop:
 	hid_hw_stop(hdev);
 err_wq:
-	destroy_workqueue(con->rumble_queue);
+	destroy_workqueue(ctlr->rumble_queue);
 err:
 	hid_err(hdev, "probe - fail = %d\n", ret);
 	return ret;
 }
 
-static void nx_hid_remove(struct hid_device *hdev)
+static void nintendo_hid_remove(struct hid_device *hdev)
 {
-	struct nx_con *con = hid_get_drvdata(hdev);
+	struct joycon_ctlr *ctlr = hid_get_drvdata(hdev);
 	unsigned long flags;
 
 	hid_dbg(hdev, "remove\n");
 
 	/* Prevent further attempts at sending subcommands. */
-	spin_lock_irqsave(&con->lock, flags);
-	con->state = NX_CON_STATE_REMOVED;
-	spin_unlock_irqrestore(&con->lock, flags);
+	spin_lock_irqsave(&ctlr->lock, flags);
+	ctlr->ctlr_state = JOYCON_CTLR_STATE_REMOVED;
+	spin_unlock_irqrestore(&ctlr->lock, flags);
 
-	destroy_workqueue(con->rumble_queue);
+	destroy_workqueue(ctlr->rumble_queue);
+	ida_free(&nintendo_player_id_allocator, ctlr->player_id);
 
 	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
 }
 
-static const struct hid_device_id nx_hid_devices[] = {
-	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_PROCON)        },
-	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_CHRGGRIP)      },
-	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_SNESCON)       },
-	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_GENCON)        },
-	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_N64CON)        },
+#ifdef CONFIG_PM
 
-	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_PROCON)  },
-	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_JOYCONL) },
-	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_JOYCONR) },
-	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_SNESCON) },
-	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_GENCON)  },
-	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO, USB_DEVICE_ID_NINTENDO_N64CON)  },
+static int nintendo_hid_resume(struct hid_device *hdev)
+{
+	int ret = joycon_init(hdev);
+
+	if (ret)
+		hid_err(hdev, "Failed to restore controller after resume");
+
+	return ret;
+}
+
+#endif
+
+static const struct hid_device_id nintendo_hid_devices[] = {
+	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_PROCON) },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_SNESCON) },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_GENCON) },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_N64CON) },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_PROCON) },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_CHRGGRIP) },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_JOYCONL) },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_JOYCONR) },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_SNESCON) },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_GENCON) },
+	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
+			 USB_DEVICE_ID_NINTENDO_N64CON) },
 	{ }
 };
-MODULE_DEVICE_TABLE(hid, nx_hid_devices);
+MODULE_DEVICE_TABLE(hid, nintendo_hid_devices);
 
-static struct hid_driver nx_hid_driver = {
-	.name		= "nx",
-	.id_table	= nx_hid_devices,
-	.probe		= nx_hid_probe,
-	.remove		= nx_hid_remove,
-	.raw_event	= nx_hid_event,
+static struct hid_driver nintendo_hid_driver = {
+	.name		= "nintendo",
+	.id_table	= nintendo_hid_devices,
+	.probe		= nintendo_hid_probe,
+	.remove		= nintendo_hid_remove,
+	.raw_event	= nintendo_hid_event,
+
+#ifdef CONFIG_PM
+	.resume		= nintendo_hid_resume,
+#endif
 };
-module_hid_driver(nx_hid_driver);
+static int __init nintendo_init(void)
+{
+	return hid_register_driver(&nintendo_hid_driver);
+}
+
+static void __exit nintendo_exit(void)
+{
+	hid_unregister_driver(&nintendo_hid_driver);
+	ida_destroy(&nintendo_player_id_allocator);
+}
+
+module_init(nintendo_init);
+module_exit(nintendo_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Ryan McClelland <rymcclel@gmail.com>");
 MODULE_AUTHOR("Emily Strickland <linux@emily.st>");
 MODULE_AUTHOR("Daniel J. Ogorchock <djogorchock@gmail.com>");
 MODULE_DESCRIPTION("Driver for Nintendo Switch Controllers");
+
