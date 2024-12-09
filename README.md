@@ -93,9 +93,7 @@ Next, clone the source code.
 
 Then run the following commands as root or using `sudo`.
 
-    dkms add .
-    dkms build hid-nx/1.14
-    dkms install hid-nx/1.14
+dkms add . && dkms build hid-nx/1.14 && dkms install hid-nx/1.14
 
 
 Uninstallation
@@ -103,10 +101,7 @@ Uninstallation
 
 To remove fully, run the following commands as root or using `sudo`.
 
-    modprobe -r hid_nx
-    dkms uninstall hid-nx/1.14
-    dkms remove hid-nx/1.14
-    rm -rf /usr/src/hid-nx-*
+modprobe -r hid_nx && dkms uninstall hid-nx/1.14 && dkms remove hid-nx/1.14 --all && rm -rf /usr/src/hid-nx-*
 
 
 Combining Joy-Con devices
