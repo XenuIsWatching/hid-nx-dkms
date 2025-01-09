@@ -461,9 +461,12 @@ static const struct joycon_ctlr_button_mapping snescon_button_mappings[] = {
  * gets assigned to BTN_EAST instead of BTN_A).
  */
 static const struct joycon_ctlr_button_mapping gencon_button_mappings[] = {
-	{ BTN_SOUTH,	JC_BTN_A,	},
-	{ BTN_EAST,	JC_BTN_B,	},
-	{ BTN_WEST,	JC_BTN_R,	},
+	{ BTN_A,	JC_BTN_A,	},
+	{ BTN_B,	JC_BTN_B,	},
+	{ BTN_C,	JC_BTN_R,	},
+	{ BTN_X,	JC_BTN_X,	}, /* MD/GEN 6B Only */
+	{ BTN_Y,	JC_BTN_Y,	}, /* MD/GEN 6B Only */
+	{ BTN_Z,	JC_BTN_L,	}, /* MD/GEN 6B Only */
 	{ BTN_SELECT,	JC_BTN_ZR,	},
 	{ BTN_START,	JC_BTN_PLUS,	},
 	{ BTN_MODE,	JC_BTN_HOME,	},
