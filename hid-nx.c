@@ -461,12 +461,12 @@ static const struct joycon_ctlr_button_mapping snescon_button_mappings[] = {
  * gets assigned to BTN_EAST instead of BTN_A).
  */
 static const struct joycon_ctlr_button_mapping gencon_button_mappings[] = {
-	{ BTN_A,	JC_BTN_A,	},
-	{ BTN_B,	JC_BTN_B,	},
-	{ BTN_C,	JC_BTN_R,	},
-	{ BTN_X,	JC_BTN_X,	}, /* MD/GEN 6B Only */
-	{ BTN_Y,	JC_BTN_Y,	}, /* MD/GEN 6B Only */
-	{ BTN_Z,	JC_BTN_L,	}, /* MD/GEN 6B Only */
+	{ BTN_WEST,	JC_BTN_A,	},
+	{ BTN_SOUTH,	JC_BTN_B,	},
+	{ BTN_EAST,	JC_BTN_R,	},
+	{ BTN_TL,	JC_BTN_X,	}, /* MD/GEN 6B Only */
+	{ BTN_NORTH,	JC_BTN_Y,	}, /* MD/GEN 6B Only */
+	{ BTN_TR,	JC_BTN_L,	}, /* MD/GEN 6B Only */
 	{ BTN_SELECT,	JC_BTN_ZR,	},
 	{ BTN_START,	JC_BTN_PLUS,	},
 	{ BTN_MODE,	JC_BTN_HOME,	},
@@ -1715,6 +1715,7 @@ static void joycon_report_buttons(struct joycon_ctlr *ctlr,
 {
 	const struct joycon_ctlr_button_mapping *button;
 	u32 status = hid_field_extract(ctlr->hdev, rep->button_status, 0, 24);
+	hid_info(ctlr->hdev, "status: 0x%x", status);
 
 	for (button = button_mappings; button->code; button++)
 		input_report_key(ctlr->input, button->code, status & button->bit);
